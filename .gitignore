@@ -1,0 +1,26 @@
+# LaTeX build artifacts
+*.aux
+*.log
+*.toc
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+*.idx
+*.ilg
+*.ind
+*.lof
+*.lot
+
+# Generated PDF (compile locally, don't track)
+*.pdf
+
+# Editor files
+*.swp
+*.swo
+*~
