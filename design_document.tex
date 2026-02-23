@@ -1,0 +1,126 @@
+\documentclass[12pt, a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{titlesec}
+
+\geometry{margin=1in}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+% ── Title ─────────────────────────────────────────────────
+\title{
+    \textbf{Design Document} \\[0.5em]
+    \Large Accelerated Mobile Video Processing System \\[0.5em]
+    \large COP7001 — Cornerstone Project
+}
+\author{
+    Salil Gujar (2025MCS2106) \\
+    Nitish Kumar (2025MCS2100)
+}
+\date{\today}
+
+% ══════════════════════════════════════════════════════════
+\begin{document}
+
+\maketitle
+\newpage
+\tableofcontents
+\newpage
+
+% ── 1. Introduction ──────────────────────────────────────
+\section{Introduction}
+
+\subsection{Project Overview}
+This project aims to build a real-time Android camera application that applies per-pixel filters (specifically a $5 \times 5$ Gaussian blur) to live video frames[cite: 35]. The core objective is to demonstrate and benchmark performance differences across four distinct processing modes: Baseline (CPU), SIMD (ARM NEON), GPU (OpenGL ES), and Hybrid[cite: 36].
+
+\subsection{Goals}
+\begin{itemize}
+    \item Implement a functional camera pipeline using the Android Camera2 API[cite: 38].
+    \item optimize pixel processing using NEON intrinsics and OpenGL ES Compute Shaders[cite: 40, 41].
+    \item Visualize real-time metrics (FPS, latency) via an on-screen dashboard[cite: 43].
+\end{itemize}
+
+% ── 2. System Overview ───────────────────────────────────
+\section{System Overview}
+
+\subsection{High-Level Architecture}
+The system captures frames at $1280 \times 720$ resolution in YUV format. These frames are converted to RGBA before being passed to one of the four processing backends. The processed frame is then rendered to the display surface[cite: 38].
+
+\subsection{Processing Modes}
+The application supports four selectable modes[cite: 36]:
+\begin{enumerate}
+    \item \textbf{Baseline:} Plain C implementation using nested loops (Correctness Reference)[cite: 39].
+    \item \textbf{SIMD:} vectorized implementation using ARM NEON intrinsics to process 16 bytes per cycle[cite: 40].
+    \item \textbf{GPU:} Offloaded processing using OpenGL ES Compute Shaders and SSBOs[cite: 41].
+    \item \textbf{Hybrid:} A split-frame approach where the top half is processed by NEON and the bottom half by the GPU[cite: 42].
+\end{enumerate}
+
+% ── 3. Detailed Module Design ────────────────────────────
+\section{Detailed Module Design}
+
+\subsection{Camera Capture Module}
+We utilize the Android Camera2 API to capture live frames. The target resolution is set to $1280 \times 720$ using the \texttt{YUV\_420\_888} format[cite: 38]. A conversion step is required to transform YUV data into RGBA for filter processing.
+
+\subsection{Baseline Filter Module}
+This module implements the $5 \times 5$ Gaussian blur using standard C nested loops invoked via JNI. This serves as the baseline for performance comparisons and the "ground truth" for visual correctness[cite: 39].
+
+\subsection{SIMD Filter Module}
+The SIMD module rewrites the baseline filter using ARM NEON intrinsics. The data structure will be aligned to 128-bit registers to allow processing of 16 bytes simultaneously[cite: 40, 48].
+
+\subsection{GPU Filter Module}
+The GPU module treats the filter as a standalone program. Data is transferred to the GPU via a Shader Storage Buffer Object (SSBO), processed by a compute shader, and the result is read back for display[cite: 41].
+
+\subsection{Hybrid Filter Module}
+This module manages workload distribution, assigning the top half of the frame to the NEON path and the bottom half to the GPU path. It handles the synchronization and stitching of the final output buffer[cite: 42].
+
+\subsection{Dashboard / HUD Module}
+A transparent overlay that renders performance statistics including Frames Per Second (FPS), processing latency, the currently active mode, and the split ratio (in Hybrid mode)[cite: 43].
+
+% ── 4. Data Flow & Pipeline ──────────────────────────────
+\section{Data Flow and Pipeline}
+
+\subsection{Frame Lifecycle}
+\begin{enumerate}
+    \item \textbf{Capture:} Camera2 API generates a \texttt{YUV\_420\_888} frame.
+    \item \textbf{Conversion:} Frame is converted to RGBA.
+    \item \textbf{Processing:} JNI hands the buffer to the active backend (C/NEON/GPU).
+    \item \textbf{Render:} The modified buffer is drawn to the \texttt{SurfaceView}.
+\end{enumerate}
+
+% ── 5. Implementation Strategy ──────────────────────────
+\section{Implementation Strategy & Timeline}
+
+Our development approach focuses on establishing a correctness baseline before optimization[cite: 45].
+
+\begin{itemize}
+    \item \textbf{Phase 1: End-to-End Pipeline.} The critical path is getting the Camera2 $\rightarrow$ JNI $\rightarrow$ Screen loop working with the Baseline filter. Once live frames are flowing, further modes are treated as optimizations of this path[cite: 45].
+    \item \textbf{Phase 2: Toolchain Setup.} Early effort will be dedicated to NDK and JNI configuration to avoid toolchain blockers[cite: 46].
+    \item \textbf{Phase 3: Parallel Development.}
+    \begin{itemize}
+        \item \textbf{NEON:} Start with a simple filter (e.g., grayscale) to validate the intrinsics workflow before implementing the Gaussian kernel[cite: 47].
+        \item \textbf{GPU:} Develop the compute shader in isolation, as it is a self-contained program[cite: 49].
+    \end{itemize}
+    \item \textbf{Phase 4: Hybrid Integration.} Once NEON and GPU paths are stable, we will implement the scheduling and stitching logic[cite: 50].
+\end{itemize}
+
+% ── References ───────────────────────────────────────────
+\section*{References}
+% TODO: Add Android NDK, ARM NEON, and OpenGL ES documentation links here.
+
+\end{document}
