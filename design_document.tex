@@ -4,7 +4,6 @@
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{geometry}
-\usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{booktabs}
@@ -12,7 +11,7 @@
 \usepackage{listings}
 \usepackage{float}
 \usepackage{amsmath}
-\usepackage{titlesec}
+\usepackage{array}
 
 \geometry{margin=1in}
 
@@ -23,104 +22,264 @@
     citecolor=blue
 }
 
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    breaklines=true
+}
+
 % ── Title ─────────────────────────────────────────────────
 \title{
-    \textbf{Design Document} \\[0.5em]
-    \Large Accelerated Mobile Video Processing System \\[0.5em]
-    \large COP7001 — Cornerstone Project
+    \textbf{Design Document} \\
+    \Large Accelerated Mobile Video Processing System \\
 }
 \author{
     Salil Gujar (2025MCS2106) \\
     Nitish Kumar (2025MCS2100)
 }
-\date{\today}
+\date{}
 
 % ══════════════════════════════════════════════════════════
 \begin{document}
 
 \maketitle
-\newpage
-\tableofcontents
-\newpage
+
 
 % ── 1. Introduction ──────────────────────────────────────
 \section{Introduction}
 
 \subsection{Project Overview}
-This project aims to build a real-time Android camera application that applies per-pixel filters (specifically a $5 \times 5$ Gaussian blur) to live video frames[cite: 35]. The core objective is to demonstrate and benchmark performance differences across four distinct processing modes: Baseline (CPU), SIMD (ARM NEON), GPU (OpenGL ES), and Hybrid[cite: 36].
+This project aims to build a real-time Android camera application that applies per-pixel
+filters — specifically a $5 \times 5$ Gaussian blur — to live video frames and displays
+the result. The system must process live camera frames continuously and display the
+transformed output in real time. It needs four processing modes: Baseline (plain C),
+SIMD (ARM NEON), GPU (OpenGL ES compute shader), and Hybrid (CPU + GPU splitting
+the frame). This is evaluated as a systems and performance engineering problem, not as
+a graphics or UI exercise. All computation occurs entirely on the mobile device.
 
 \subsection{Goals}
 \begin{itemize}
-    \item Implement a functional camera pipeline using the Android Camera2 API[cite: 38].
-    \item optimize pixel processing using NEON intrinsics and OpenGL ES Compute Shaders[cite: 40, 41].
-    \item Visualize real-time metrics (FPS, latency) via an on-screen dashboard[cite: 43].
+    \item Implement a functional end-to-end camera pipeline using the Android Camera2 API,
+          capable of continuous frame capture, processing, and display without manual triggering.
+    \item Accelerate pixel processing using ARM NEON intrinsics and OpenGL ES Compute Shaders,
+          achieving measurable throughput improvements over the scalar baseline.
+    \item Support runtime switching between all four execution modes without restarting the
+          application.
+    \item Display real-time performance metrics — FPS, latency, active mode, and resource
+          utilisation indicators — via an on-screen dashboard overlay.
+    \item Verify functional correctness of all accelerated modes against the baseline output
+          within acceptable numerical tolerance.
 \end{itemize}
 
 % ── 2. System Overview ───────────────────────────────────
 \section{System Overview}
 
 \subsection{High-Level Architecture}
-The system captures frames at $1280 \times 720$ resolution in YUV format. These frames are converted to RGBA before being passed to one of the four processing backends. The processed frame is then rendered to the display surface[cite: 38].
+The system operates as a continuous camera pipeline. Frames are captured at $1280 \times 720$
+resolution in \texttt{YUV\_420\_888} format using the Camera2 API. Each frame is first
+converted to RGBA, then dispatched to one of four selectable processing backends. The processed
+frame is rendered to a \texttt{SurfaceView} for display. A transparent HUD overlay sits above
+the rendered output and shows live performance statistics.
+
+\subsection{Target Device}
+Physical Android device, API 26+, ARM64.
 
 \subsection{Processing Modes}
-The application supports four selectable modes[cite: 36]:
 \begin{enumerate}
-    \item \textbf{Baseline:} Plain C implementation using nested loops (Correctness Reference)[cite: 39].
-    \item \textbf{SIMD:} vectorized implementation using ARM NEON intrinsics to process 16 bytes per cycle[cite: 40].
-    \item \textbf{GPU:} Offloaded processing using OpenGL ES Compute Shaders and SSBOs[cite: 41].
-    \item \textbf{Hybrid:} A split-frame approach where the top half is processed by NEON and the bottom half by the GPU[cite: 42].
+    \item \textbf{Baseline:} Plain C implementation using nested loops, called via JNI. This
+          is the correctness reference and the performance floor against which all other modes
+          are measured.
+    \item \textbf{SIMD:} Vectorised implementation using ARM NEON intrinsics. The filter is
+          rewritten to operate on 128-bit registers, processing 16 bytes per cycle.
+    \item \textbf{GPU:} The filter is offloaded to an OpenGL ES 3.1 compute shader. Data goes
+          to the GPU through an SSBO, the shader runs, and the result is read back.
+    \item \textbf{Hybrid:} A split-frame approach — top half to NEON, bottom half to GPU —
+          stitched before display.
 \end{enumerate}
+
+The output produced in all modes must be functionally equivalent within acceptable numerical
+tolerance. Switching between execution modes must occur at runtime without restarting the
+application.
 
 % ── 3. Detailed Module Design ────────────────────────────
 \section{Detailed Module Design}
 
 \subsection{Camera Capture Module}
-We utilize the Android Camera2 API to capture live frames. The target resolution is set to $1280 \times 720$ using the \texttt{YUV\_420\_888} format[cite: 38]. A conversion step is required to transform YUV data into RGBA for filter processing.
+The rear-facing camera is opened via \texttt{CameraManager.openCamera()} with a
+\texttt{CaptureRequest} configured for continuous preview at a fixed 30 fps
+(\texttt{CONTROL\_AF\_MODE\_CONTINUOUS\_VIDEO}). Frames are delivered in \texttt{YUV\_420\_888}
+format at $1280 \times 720$ through an \texttt{ImageReader}. An \texttt{OnImageAvailableListener}
+processes each frame on a dedicated background \texttt{HandlerThread}. Camera and storage
+permissions are declared in \texttt{AndroidManifest.xml}.
+
+\subsection{YUV to RGBA Conversion}
+In the JNI/C layer, the Y, U, and V planes and strides are extracted from the
+\texttt{YUV\_420\_888} image and converted to RGBA per pixel using the standard BT.601 formula.
+The result is returned to the Java/Kotlin rendering layer. This conversion is implemented in
+native C to minimise overhead.
 
 \subsection{Baseline Filter Module}
-This module implements the $5 \times 5$ Gaussian blur using standard C nested loops invoked via JNI. This serves as the baseline for performance comparisons and the "ground truth" for visual correctness[cite: 39].
+The baseline module implements the $5 \times 5$ Gaussian blur as nested loops in C, invoked
+from Java via JNI. The kernel uses precomputed float weights normalised to 1.0. R, G, and B
+channels are processed independently; the alpha channel passes through unchanged. Border pixels
+use clamp-to-edge padding. This scalar implementation is intentionally simple — its sole purpose
+is to be provably correct and to serve as the reference that all future accelerated paths are
+verified against.
 
 \subsection{SIMD Filter Module}
-The SIMD module rewrites the baseline filter using ARM NEON intrinsics. The data structure will be aligned to 128-bit registers to allow processing of 16 bytes simultaneously[cite: 40, 48].
+The SIMD module rewrites the Gaussian blur using ARM NEON intrinsics. The $5 \times 5$ kernel
+is decomposed into two separable 1D passes — horizontal then vertical — reducing per-pixel
+multiply operations from 25 to 10. The horizontal pass is implemented as follows:
+\begin{itemize}
+    \item \texttt{vld1q\_u8} loads 16-byte chunks
+    \item \texttt{vextq\_u8} constructs shifted neighbour views for kernel access
+    \item \texttt{vmull\_u8} and \texttt{vmlal\_u8} handle weighted accumulation
+    \item \texttt{vshrn\_n\_u16} narrows back to \texttt{uint8x8\_t}
+\end{itemize}
+The vertical pass follows the same structure using a row pointer array. Pixel data buffers are
+aligned to 16-byte boundaries to ensure optimal register utilisation. Border handling matches
+the scalar reference exactly so that correctness comparison is unambiguous.
 
 \subsection{GPU Filter Module}
-The GPU module treats the filter as a standalone program. Data is transferred to the GPU via a Shader Storage Buffer Object (SSBO), processed by a compute shader, and the result is read back for display[cite: 41].
+The GPU module offloads the filter to an OpenGL ES 3.1 compute shader. An EGL context is
+initialised on the processing thread (\texttt{EGL\_OPENGL\_ES3\_BIT}) with an offscreen
+\texttt{EGL\_PBUFFER\_BIT} surface for headless GPU computation. The RGBA frame buffer is
+uploaded to the GPU as an SSBO:
+
+\begin{lstlisting}[language=C]
+glGenBuffers(1, &ssbo);
+glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+glBufferData(GL_SHADER_STORAGE_BUFFER, size, data, GL_DYNAMIC_COPY);
+\end{lstlisting}
+
+The compute shader (\texttt{\#version 310 es}) assigns one invocation per pixel in $16 \times 16$
+work groups. Each invocation reads a $5 \times 5$ neighbourhood from the input SSBO, applies
+Gaussian weights, and writes its result to the output SSBO. Image borders are handled with
+conditional clamping in the shader. The dispatch is:
+
+\begin{lstlisting}[language=C]
+glDispatchCompute(width / 16, height / 16, 1);
+glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+\end{lstlisting}
+
+Results are read back to CPU via \texttt{glGetBufferSubData()}. The compute shader is a
+self-contained program and is developed independently of the CPU paths.
 
 \subsection{Hybrid Filter Module}
-This module manages workload distribution, assigning the top half of the frame to the NEON path and the bottom half to the GPU path. It handles the synchronization and stitching of the final output buffer[cite: 42].
+The hybrid module manages workload distribution between the NEON and GPU paths within a single
+frame. The $1280 \times 720$ frame is split horizontally at a configurable split row (default:
+row 360). The top half is sent to the NEON filter on a CPU \texttt{pthread}; the bottom half
+is dispatched to the GPU shader concurrently. Completion is synchronised via
+\texttt{pthread\_join()} for the NEON thread and \texttt{glFinish()} on the GL thread. The
+two output halves are stitched with \texttt{memcpy()}. The split ratio is configurable and
+displayed on the dashboard.
+
+Rather than a fixed 50/50 split, the split row is computed dynamically based on measured
+throughput:
+\[
+    \text{split\_row} = \frac{\text{NEON\_throughput}}{\text{NEON\_throughput} + \text{GPU\_throughput}} \times \text{height}
+\]
+This balances both execution paths to finish at approximately the same time, eliminating the
+idle wait before stitching.
 
 \subsection{Dashboard / HUD Module}
-A transparent overlay that renders performance statistics including Frames Per Second (FPS), processing latency, the currently active mode, and the split ratio (in Hybrid mode)[cite: 43].
-
-% ── 4. Data Flow & Pipeline ──────────────────────────────
-\section{Data Flow and Pipeline}
-
-\subsection{Frame Lifecycle}
-\begin{enumerate}
-    \item \textbf{Capture:} Camera2 API generates a \texttt{YUV\_420\_888} frame.
-    \item \textbf{Conversion:} Frame is converted to RGBA.
-    \item \textbf{Processing:} JNI hands the buffer to the active backend (C/NEON/GPU).
-    \item \textbf{Render:} The modified buffer is drawn to the \texttt{SurfaceView}.
-\end{enumerate}
-
-% ── 5. Implementation Strategy ──────────────────────────
-\section{Implementation Strategy & Timeline}
-
-Our development approach focuses on establishing a correctness baseline before optimization[cite: 45].
-
+The dashboard is a mandatory system component and is treated with the same rigour as the
+processing backends. It is rendered as a semi-transparent overlay above the live camera output
+and updates every rendered frame. The dashboard displays:
 \begin{itemize}
-    \item \textbf{Phase 1: End-to-End Pipeline.} The critical path is getting the Camera2 $\rightarrow$ JNI $\rightarrow$ Screen loop working with the Baseline filter. Once live frames are flowing, further modes are treated as optimizations of this path[cite: 45].
-    \item \textbf{Phase 2: Toolchain Setup.} Early effort will be dedicated to NDK and JNI configuration to avoid toolchain blockers[cite: 46].
-    \item \textbf{Phase 3: Parallel Development.}
-    \begin{itemize}
-        \item \textbf{NEON:} Start with a simple filter (e.g., grayscale) to validate the intrinsics workflow before implementing the Gaussian kernel[cite: 47].
-        \item \textbf{GPU:} Develop the compute shader in isolation, as it is a self-contained program[cite: 49].
-    \end{itemize}
-    \item \textbf{Phase 4: Hybrid Integration.} Once NEON and GPU paths are stable, we will implement the scheduling and stitching logic[cite: 50].
+    \item Currently active execution mode (\texttt{BASELINE / SIMD / GPU / HYBRID})
+    \item Live frame rate (FPS) — rolling average over last 30 frames
+    \item Per-frame processing latency in milliseconds
+    \item End-to-end latency from \texttt{ImageReader} callback to \texttt{unlockCanvasAndPost()}
+    \item SIMD active indicator — green (active) / red (inactive)
+    \item GPU execution activity indicator — active when a shader is dispatched
+    \item Thermal proxy — CPU temperature in \textdegree C, polled from
+          \texttt{/sys/class/thermal/thermal\_zone*/temp}
+    \item Speedup ratio vs.\ baseline for all non-baseline modes (e.g., $3.2\times$)
+    \item Jitter events — count of frame time spikes exceeding $2\times$ the rolling median
+          in the last 60 seconds
+    \item Frame split ratio in Hybrid mode (e.g., \texttt{360 rows CPU / 360 rows GPU})
+    \item PASS/FAIL correctness flags for SIMD and GPU modes
 \end{itemize}
 
-% ── References ───────────────────────────────────────────
-\section*{References}
-% TODO: Add Android NDK, ARM NEON, and OpenGL ES documentation links here.
+The final dashboard layout is as follows:
+\begin{lstlisting}
++---------------------------------------------+
+|  MODE: [HYBRID]         FPS: 42.3           |
+|  Frame latency:  18.4 ms                    |
+|  End-to-end:     22.1 ms                    |
++---------------------------------------------+
+|  SIMD  [################    ]  ACTIVE       |
+|  GPU   [########            ]  ACTIVE       |
+|  Split: 360 rows CPU / 360 rows GPU         |
++---------------------------------------------+
+|  Baseline: 84.2 ms   Speedup: 4.6x          |
+|  Thermal: 38 C        Jitter events: 0      |
++---------------------------------------------+
+\end{lstlisting}
+
+Mode label colours: grey $\rightarrow$ Baseline, blue $\rightarrow$ SIMD, green $\rightarrow$
+GPU, yellow $\rightarrow$ Hybrid.
+
+% ── 4. Data Flow ─────────────────────────────────────────
+\section{Data Flow and Frame Lifecycle}
+
+Each frame follows the same pipeline regardless of the active execution mode:
+\begin{enumerate}
+    \item \textbf{Capture:} Camera2 API delivers a \texttt{YUV\_420\_888} frame via
+          \texttt{ImageReader} callback.
+    \item \textbf{Conversion:} Frame is converted from YUV to a packed RGBA buffer in native
+          C via JNI.
+    \item \textbf{Dispatch:} The RGBA buffer is handed to the currently active backend. In
+          Hybrid mode, the buffer is split and dispatched to two backends simultaneously.
+    \item \textbf{Processing:} The selected backend applies the $5 \times 5$ Gaussian blur and
+          writes the result into an output buffer.
+    \item \textbf{Stitch (Hybrid only):} The NEON and GPU output halves are merged into a
+          single output buffer via \texttt{memcpy()}.
+    \item \textbf{Render:} The output buffer is drawn to the \texttt{SurfaceView} via
+          \texttt{Bitmap.copyPixelsFromBuffer()} and \texttt{Canvas}, and the dashboard
+          overlay is updated with the latest metrics.
+\end{enumerate}
+
+End-to-end latency is measured at four points in this pipeline: (1) \texttt{ImageReader}
+callback entry, (2) YUV$\rightarrow$RGBA conversion complete, (3) filter processing complete,
+and (4) \texttt{unlockCanvasAndPost()} complete. End-to-end latency is defined as point (4)
+minus point (1) for every frame.
+
+% ── 5. Correctness Verification ──────────────────────────
+\section{Correctness Verification}
+
+Both accelerated paths are verified against the scalar baseline before being made available
+at runtime. The demo does not proceed until both SIMD and GPU correctness flags show PASS.
+
+\textbf{SIMD:} Both scalar and NEON paths are run on the same static test frame. Outputs are
+compared byte-by-byte in JNI using \texttt{memcmp()}, with a tolerance of $\pm 1$ per channel
+to account for rounding differences in integer NEON arithmetic. SIMD mode is only activated
+once verification passes. This gate remains permanent throughout the project.
+
+\textbf{GPU:} The scalar baseline and GPU path are run on the same static frame and compared
+in JNI. A tolerance of $\pm 2$ per channel is used to account for floating-point arithmetic
+in the shader. GPU correctness status is shown on the dashboard.
+
+% ── 6. Memory and Buffer Design ──────────────────────────
+\section{Memory and Buffer Design}
+
+To avoid garbage collection pauses in the hot path, three allocations are pre-allocated at
+session start and reused across frames:
+\begin{itemize}
+    \item \textbf{Bitmap:} A single \texttt{Bitmap} is allocated once and updated in-place
+          per frame via \texttt{copyPixelsFromBuffer()}, replacing per-frame
+          \texttt{Bitmap.createBitmap()} calls.
+    \item \textbf{SSBO:} The GPU Shader Storage Buffer Object is pre-allocated at session start
+          and updated per frame with \texttt{glBufferSubData()} instead of
+          \texttt{glBufferData()}.
+    \item \textbf{NEON buffers:} Intermediate row buffers for the separable filter passes are
+          pre-allocated; \texttt{malloc} is removed from the filter inner loop.
+\end{itemize}
+
+
+
+
 
 \end{document}
