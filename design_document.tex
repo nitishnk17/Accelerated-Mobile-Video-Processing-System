@@ -46,8 +46,8 @@ filters - specifically a $5 \times 5$ Gaussian blur - to live video frames and d
 the result. The system must process live camera frames continuously and display the
 transformed output in real time. It needs four processing modes: Baseline (plain C++),
 SIMD (ARM NEON), GPU (OpenGL ES compute shader), and Hybrid (CPU + GPU splitting
-the frame). This is evaluated as a systems and performance engineering problem, not as
-a graphics or UI exercise. All computation occurs entirely on the mobile device.
+the frame). The primary focus is on systems-level optimisation and real-time performance
+on constrained mobile hardware. All computation occurs entirely on the mobile device.
 
 \subsection{Goals}
 \begin{itemize}
