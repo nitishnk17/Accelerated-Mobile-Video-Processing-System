@@ -47,6 +47,14 @@ class MainActivity : ComponentActivity() {
     // body implemented in native-lib.cpp via JNI
     external fun nativeGetStatus(): String
 
+    // converts a yuv_420_888 frame to rgba using bt.601 in native code (zero-copy via direct ByteBuffers)
+    external fun nativeYuvToRgba(
+        yBuffer: java.nio.ByteBuffer, uBuffer: java.nio.ByteBuffer, vBuffer: java.nio.ByteBuffer,
+        width: Int, height: Int,
+        yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
+        rgbaOut: java.nio.ByteBuffer
+    )
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -90,9 +98,16 @@ fun CameraScreen() {
     // dashboard state — each var triggers only its own text to recompose
     var currentFps          by remember { mutableStateOf(0.0) }
     var processingLatencyMs by remember { mutableStateOf(0L) }
+    var conversionLatencyMs by remember { mutableStateOf(0L) }
     var endToEndLatencyMs   by remember { mutableStateOf(0L) }
     var cpuUsagePercent     by remember { mutableStateOf(0.0) }
     var frameIntervalMs     by remember { mutableStateOf(-1L) }
+
+    // pre-allocate the rgba output buffer once using direct memory; zero-copy for JNI
+    val rgbaBuffer = remember { java.nio.ByteBuffer.allocateDirect(1280 * 720 * 4) }
+
+    // need a reference to the activity to call the jni method
+    val activity = context as MainActivity
 
     // non-reactive refs used only for cleanup on dispose
     val cameraDeviceRef   = remember { arrayOfNulls<CameraDevice>(1) }
@@ -147,6 +162,25 @@ fun CameraScreen() {
                 Log.d(TAG, "frame: hw=${hwTimestampNs / 1_000_000}ms  interval=${intervalMs}ms")
                 if (intervalMs > 40L) Log.w(TAG, "frame gap ${intervalMs}ms — possible dropped frame")
 
+            
+                // image.planes[].buffer already returns direct ByteBuffers (no copy needed)
+                val yBuffer = image.planes[0].buffer
+                val uBuffer = image.planes[1].buffer
+                val vBuffer = image.planes[2].buffer
+
+                val yRowStride    = image.planes[0].rowStride
+                val uvRowStride   = image.planes[1].rowStride
+                val uvPixelStride = image.planes[1].pixelStride
+
+                val convStart = System.currentTimeMillis()
+                activity.nativeYuvToRgba(
+                    yBuffer, uBuffer, vBuffer,
+                    1280, 720,
+                    yRowStride, uvRowStride, uvPixelStride,
+                    rgbaBuffer
+                )
+                val convLatency = System.currentTimeMillis() - convStart
+
                 val procLatency = System.currentTimeMillis() - processingStart
                 val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
 
@@ -154,6 +188,7 @@ fun CameraScreen() {
                 mainHandler.post {
                     currentFps          = fps
                     processingLatencyMs = procLatency
+                    conversionLatencyMs = convLatency
                     endToEndLatencyMs   = e2eLatency
                     frameIntervalMs     = intervalMs
                 }
@@ -204,6 +239,7 @@ fun CameraScreen() {
             Text("MODE: BASELINE", color = Color.Gray, fontSize = 13.sp, fontWeight = FontWeight.Bold)
 
             Text("FPS:  ${String.format("%.1f", currentFps)}", color = Color.White, fontSize = 13.sp)
+            Text("Conv: ${conversionLatencyMs} ms",            color = Color.White, fontSize = 13.sp)
             Text("Proc: ${processingLatencyMs} ms",            color = Color.White, fontSize = 13.sp)
             Text("E2E:  ${endToEndLatencyMs} ms",              color = Color.White, fontSize = 13.sp)
 
