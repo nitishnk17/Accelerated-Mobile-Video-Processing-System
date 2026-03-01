@@ -86,11 +86,11 @@ dependencies {
     //all 4 modules must be in the same version to stay compatible
     //core -> base interface, camera2-> actual camera implemtation that drives the hardware
     //lifecycle-> automatically open/close the camera, view-> provide previewView a ready made view of display
-    var cameraxVersion="1.3.1"
-    implementation("androidx.camera:camera-core:$cameraxVersion")
-    implementation("androidx.camera:camera-camera2:$cameraxVersion")
-    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
-    implementation("androidx.camera:camera-view:$cameraxVersion")
+    //var cameraxVersion="1.3.1"
+    //implementation("androidx.camera:camera-core:$cameraxVersion")
+    //implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    //implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+    //implementation("androidx.camera:camera-view:$cameraxVersion")
 
     //we also need this for camera permissions
     implementation("com.google.accompanist:accompanist-permissions:0.34.0")
