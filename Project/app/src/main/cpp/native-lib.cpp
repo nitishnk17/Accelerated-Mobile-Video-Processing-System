@@ -2,17 +2,10 @@
 
 #include <jni.h>
 #include <string>
-#include <cstdint>
-#include <algorithm>
 #include <android/log.h>
 
 #define LOG_TAG "CSProject"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
-// clamp an integer to [0, 255] — used after yuv→rgb math
-static inline uint8_t clamp8(int v) {
-    return static_cast<uint8_t>(std::max(0, std::min(255, v)));
-}
 
 // called from kotlin at startup to verify the ndk toolchain is working
 extern "C" JNIEXPORT jstring JNICALL
@@ -21,58 +14,56 @@ Java_com_example_csproject_MainActivity_nativeGetStatus(JNIEnv* env, jobject /* 
     return env->NewStringUTF("JNI OK — NDK toolchain ready");
 }
 
-// converts a yuv_420_888 frame to rgba in-place using bt.601
-// yuv_420_888 layout:
-//   Y plane  — one byte per pixel, full resolution (w × h)
-//   U plane  — one byte per 2×2 block, subsampled
-//   V plane  — one byte per 2×2 block, subsampled
-
-// bt.601 conversion (fixed-point, shift by 10 to avoid floats):
-//   R = Y + 1.370705 * (V-128)  →  Y + (1404*(V-128)) >> 10
-//   G = Y - 0.337633 * (U-128) - 0.698001 * (V-128)  →  Y - (346*(U-128) + 715*(V-128)) >> 10
-//   B = Y + 1.732446 * (U-128)  →  Y + (1774*(U-128)) >> 10
-
-extern "C" JNIEXPORT void JNICALL
+// converts yuv_420_888 planes to rgba using bt.601 scalar conversion
+// stores result in a new jbyteArray and returns it to kotlin
+extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_example_csproject_MainActivity_nativeYuvToRgba(
         JNIEnv* env, jobject,
-        jobject yBuffer, jobject uBuffer, jobject vBuffer,
+        jbyteArray yArray, jbyteArray uArray, jbyteArray vArray,
         jint width, jint height,
-        // strides-rows can be padded beyond image width, and uv pixels may be
-        // interleaved (pixelStride=2, e.g. NV21) or planar (pixelStride=1)
-        jint yRowStride, jint uvRowStride, jint uvPixelStride,
-        jobject rgbaOut) {
+        jint yRowStride, jint uvRowStride, jint uvPixelStride) {
 
-    // get direct buffer addresses for zero-copy access from Java to C++
-    auto* y   = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuffer));
-    auto* u   = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuffer));
-    auto* v   = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuffer));
-    auto* out = static_cast<uint8_t*>(env->GetDirectBufferAddress(rgbaOut));
+    jbyte* y = env->GetByteArrayElements(yArray, nullptr);
+    jbyte* u = env->GetByteArrayElements(uArray, nullptr);
+    jbyte* v = env->GetByteArrayElements(vArray, nullptr);
+
+    jbyteArray rgbaArray = env->NewByteArray(width * height * 4);
+    jbyte* rgba = env->GetByteArrayElements(rgbaArray, nullptr);
 
     for (int row = 0; row < height; row++) {
-        // hoist row-dependent pointers out of the inner loop
-        const uint8_t* yRow  = y + row * yRowStride;
-        const uint8_t* uvRow = u + (row >> 1) * uvRowStride;
-        const uint8_t* vRow  = v + (row >> 1) * uvRowStride;
-        uint8_t* outRow = out + row * width * 4;
-
         for (int col = 0; col < width; col++) {
-            int yVal = yRow[col] & 0xFF;
+            int yIdx  = row * yRowStride + col;
+            int uvIdx = (row / 2) * uvRowStride + (col / 2) * uvPixelStride;
 
-            // u and v are subsampled — each sample covers a 2×2 pixel block
-            int uvIdx = (col >> 1) * uvPixelStride;
-            int uVal = (uvRow[uvIdx] & 0xFF) - 128;
-            int vVal = (vRow[uvIdx] & 0xFF) - 128;
+            int yVal = (uint8_t)y[yIdx];
+            int uVal = (uint8_t)u[uvIdx];
+            int vVal = (uint8_t)v[uvIdx];
 
-            // bt.601 fixed-point conversion (×1024 then >>10)
-            int r = yVal + ((1404 * vVal) >> 10);
-            int g = yVal - ((346 * uVal + 715 * vVal) >> 10);
-            int b = yVal + ((1774 * uVal) >> 10);
+            // bt.601 conversion
+            int yp = yVal - 16;
+            int cb = uVal - 128;
+            int cr = vVal - 128;
 
-            outRow[0] = clamp8(r);
-            outRow[1] = clamp8(g);
-            outRow[2] = clamp8(b);
-            outRow[3] = 0xFF;  // alpha — fully opaque
-            outRow += 4;
+            int r = (298 * yp + 409 * cr + 128) >> 8;
+            int g = (298 * yp - 100 * cb - 208 * cr + 128) >> 8;
+            int b = (298 * yp + 516 * cb + 128) >> 8;
+
+            r = r < 0 ? 0 : r > 255 ? 255 : r;
+            g = g < 0 ? 0 : g > 255 ? 255 : g;
+            b = b < 0 ? 0 : b > 255 ? 255 : b;
+
+            int out = (row * width + col) * 4;
+            rgba[out]     = (jbyte)r;
+            rgba[out + 1] = (jbyte)g;
+            rgba[out + 2] = (jbyte)b;
+            rgba[out + 3] = (jbyte)255;
         }
     }
+
+    env->ReleaseByteArrayElements(yArray, y, JNI_ABORT);
+    env->ReleaseByteArrayElements(uArray, u, JNI_ABORT);
+    env->ReleaseByteArrayElements(vArray, v, JNI_ABORT);
+    env->ReleaseByteArrayElements(rgbaArray, rgba, 0);
+
+    return rgbaArray;
 }
