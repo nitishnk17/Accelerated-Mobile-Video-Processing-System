@@ -2,6 +2,7 @@
 
 #include <jni.h>
 #include <string>
+#include <cmath>
 #include <android/log.h>
 
 #define LOG_TAG "CSProject"
@@ -66,4 +67,76 @@ Java_com_example_csproject_MainActivity_nativeYuvToRgba(
     env->ReleaseByteArrayElements(rgbaArray, rgba, 0);
 
     return rgbaArray;
+}
+
+// helper — clamp an index so it stays inside the image bounds
+static inline int clampIdx(int val, int maxVal) {
+    if (val < 0)      return 0;
+    if (val >= maxVal) return maxVal - 1;
+    return val;
+}
+
+// applies a 3x3 sobel filter on the rgba buffer (r, g, b processed independently)
+// produces bright edges on a dark background; alpha stays 255
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_csproject_MainActivity_nativeSobelFilter(
+        JNIEnv* env, jobject,
+        jbyteArray rgbaInput, jint width, jint height) {
+
+    // allocate output before entering critical section (no jni calls allowed inside)
+    int totalPixels = width * height;
+    jbyteArray outArray = env->NewByteArray(totalPixels * 4);
+
+    jbyte* src = (jbyte*)env->GetPrimitiveArrayCritical(rgbaInput, nullptr);
+    jbyte* dst = (jbyte*)env->GetPrimitiveArrayCritical(outArray, nullptr);
+
+    // sobel kernels — standard 3x3
+    //  Gx:  -1  0  1     Gy:  -1 -2 -1
+    //       -2  0  2           0  0  0
+    //       -1  0  1           1  2  1
+    const int gxKernel[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
+    const int gyKernel[3][3] = {{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}};
+
+    for (int row = 0; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            int gxR = 0, gyR = 0;
+            int gxG = 0, gyG = 0;
+            int gxB = 0, gyB = 0;
+
+            // convolve 3x3 neighborhood, read all channels per neighbor
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int sr = clampIdx(row + ky, height);
+                    int sc = clampIdx(col + kx, width);
+                    int idx = (sr * width + sc) * 4;
+
+                    int r = (uint8_t)src[idx];
+                    int g = (uint8_t)src[idx + 1];
+                    int b = (uint8_t)src[idx + 2];
+
+                    int wx = gxKernel[ky + 1][kx + 1];
+                    int wy = gyKernel[ky + 1][kx + 1];
+
+                    gxR += r * wx;  gyR += r * wy;
+                    gxG += g * wx;  gyG += g * wy;
+                    gxB += b * wx;  gyB += b * wy;
+                }
+            }
+
+            int mR = (int)sqrtf((float)(gxR * gxR + gyR * gyR));
+            int mG = (int)sqrtf((float)(gxG * gxG + gyG * gyG));
+            int mB = (int)sqrtf((float)(gxB * gxB + gyB * gyB));
+
+            int out = (row * width + col) * 4;
+            dst[out]     = (jbyte)(mR > 255 ? 255 : mR);
+            dst[out + 1] = (jbyte)(mG > 255 ? 255 : mG);
+            dst[out + 2] = (jbyte)(mB > 255 ? 255 : mB);
+            dst[out + 3] = (jbyte)255;
+        }
+    }
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput, src, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outArray, dst, 0);
+
+    return outArray;
 }

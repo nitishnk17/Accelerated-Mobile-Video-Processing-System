@@ -61,6 +61,11 @@ class MainActivity : ComponentActivity() {
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int
     ): ByteArray
 
+    // runs 3x3 sobel edge detection on an rgba buffer
+    external fun nativeSobelFilter(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -105,6 +110,7 @@ fun CameraScreen() {
     var currentFps          by remember { mutableStateOf(0.0) }
     var processingLatencyMs by remember { mutableStateOf(0L) }
     var conversionLatencyMs by remember { mutableStateOf(0L) }
+    var sobelLatencyMs      by remember { mutableStateOf(0L) }
     var endToEndLatencyMs   by remember { mutableStateOf(0L) }
     var cpuUsagePercent     by remember { mutableStateOf(0.0) }
     var frameIntervalMs     by remember { mutableStateOf(-1L) }
@@ -184,9 +190,16 @@ fun CameraScreen() {
                 )
                 val convLatency = System.currentTimeMillis() - convStart
 
+                // run sobel edge detection on the rgba frame
+                val sobelStart = System.currentTimeMillis()
+                val edgeBytes = activity.nativeSobelFilter(
+                    rgbaBytes, image.width, image.height
+                )
+                val sobelLat = System.currentTimeMillis() - sobelStart
+
                 // build bitmap from rgba bytes and rotate 90° to match display orientation
                 val rawBmp = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
-                rawBmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgbaBytes))
+                rawBmp.copyPixelsFromBuffer(ByteBuffer.wrap(edgeBytes))
                 val matrix = Matrix().apply { postRotate(90f) }
                 val bmp = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
                 rawBmp.recycle()
@@ -198,6 +211,7 @@ fun CameraScreen() {
                     currentFps          = fps
                     processingLatencyMs = procLatency
                     conversionLatencyMs = convLatency
+                    sobelLatencyMs      = sobelLat
                     endToEndLatencyMs   = e2eLatency
                     frameIntervalMs     = intervalMs
                     processedBitmap     = bmp
@@ -262,7 +276,7 @@ fun CameraScreen() {
                 }
                 // label for bottom half
                 Text(
-                    text = "BASELINE",
+                    text = "SOBEL — BASELINE",
                     color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp)
                 )
@@ -281,9 +295,10 @@ fun CameraScreen() {
             Text("MODE: BASELINE", color = Color.Gray, fontSize = 13.sp, fontWeight = FontWeight.Bold)
 
             Text("FPS:  ${String.format("%.1f", currentFps)}", color = Color.White, fontSize = 13.sp)
-            Text("Conv: ${conversionLatencyMs} ms",            color = Color.White, fontSize = 13.sp)
-            Text("Proc: ${processingLatencyMs} ms",            color = Color.White, fontSize = 13.sp)
-            Text("E2E:  ${endToEndLatencyMs} ms",              color = Color.White, fontSize = 13.sp)
+            Text("Conv:  ${conversionLatencyMs} ms",           color = Color.White, fontSize = 13.sp)
+            Text("Sobel: ${sobelLatencyMs} ms",                color = Color.White, fontSize = 13.sp)
+            Text("Proc:  ${processingLatencyMs} ms",           color = Color.White, fontSize = 13.sp)
+            Text("E2E:   ${endToEndLatencyMs} ms",             color = Color.White, fontSize = 13.sp)
 
             // turns yellow if interval > 40 ms (dropped frame at 30 fps)
             val intervalDisplay = if (frameIntervalMs < 0L) "--" else "${frameIntervalMs} ms"
