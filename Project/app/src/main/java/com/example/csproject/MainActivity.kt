@@ -36,6 +36,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
+import android.graphics.Bitmap
+import android.graphics.Matrix
+import java.nio.ByteBuffer
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.delay
 import java.io.File
 
@@ -47,13 +53,13 @@ class MainActivity : ComponentActivity() {
     // body implemented in native-lib.cpp via JNI
     external fun nativeGetStatus(): String
 
-    // converts a yuv_420_888 frame to rgba using bt.601 in native code (zero-copy via direct ByteBuffers)
+    // converts yuv_420_888 planes to rgba using bt.601 in native code
+    // stores result in a new bytearray and returns it to kotlin
     external fun nativeYuvToRgba(
-        yBuffer: java.nio.ByteBuffer, uBuffer: java.nio.ByteBuffer, vBuffer: java.nio.ByteBuffer,
+        yBytes: ByteArray, uBytes: ByteArray, vBytes: ByteArray,
         width: Int, height: Int,
-        yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
-        rgbaOut: java.nio.ByteBuffer
-    )
+        yRowStride: Int, uvRowStride: Int, uvPixelStride: Int
+    ): ByteArray
 
     companion object {
         init {
@@ -103,8 +109,8 @@ fun CameraScreen() {
     var cpuUsagePercent     by remember { mutableStateOf(0.0) }
     var frameIntervalMs     by remember { mutableStateOf(-1L) }
 
-    // pre-allocate the rgba output buffer once using direct memory; zero-copy for JNI
-    val rgbaBuffer = remember { java.nio.ByteBuffer.allocateDirect(1280 * 720 * 4) }
+    // hold the latest rotated rgba bitmap for display
+    var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     // need a reference to the activity to call the jni method
     val activity = context as MainActivity
@@ -151,8 +157,6 @@ fun CameraScreen() {
                     if (spanMs > 0) (frameTimestamps.size - 1) * 1000.0 / spanMs else 0.0
                 } else 0.0
 
-                val processingStart = System.currentTimeMillis()
-
                 // inter-frame interval from hardware timestamps; ~33 ms at 30 fps
                 val hwTimestampNs = image.timestamp
                 val intervalMs = if (lastHwTimestampNs[0] > 0L)
@@ -162,35 +166,41 @@ fun CameraScreen() {
                 Log.d(TAG, "frame: hw=${hwTimestampNs / 1_000_000}ms  interval=${intervalMs}ms")
                 if (intervalMs > 40L) Log.w(TAG, "frame gap ${intervalMs}ms — possible dropped frame")
 
-            
-                // image.planes[].buffer already returns direct ByteBuffers (no copy needed)
-                val yBuffer = image.planes[0].buffer
-                val uBuffer = image.planes[1].buffer
-                val vBuffer = image.planes[2].buffer
+                val processingStart = System.currentTimeMillis()
 
-                val yRowStride    = image.planes[0].rowStride
-                val uvRowStride   = image.planes[1].rowStride
-                val uvPixelStride = image.planes[1].pixelStride
+                // copy yuv planes into byte arrays for jni
+                val yPlane = image.planes[0]
+                val uPlane = image.planes[1]
+                val vPlane = image.planes[2]
+                val yBytes = ByteArray(yPlane.buffer.remaining()).also { yPlane.buffer.get(it) }
+                val uBytes = ByteArray(uPlane.buffer.remaining()).also { uPlane.buffer.get(it) }
+                val vBytes = ByteArray(vPlane.buffer.remaining()).also { vPlane.buffer.get(it) }
 
                 val convStart = System.currentTimeMillis()
-                activity.nativeYuvToRgba(
-                    yBuffer, uBuffer, vBuffer,
-                    1280, 720,
-                    yRowStride, uvRowStride, uvPixelStride,
-                    rgbaBuffer
+                val rgbaBytes = activity.nativeYuvToRgba(
+                    yBytes, uBytes, vBytes,
+                    image.width, image.height,
+                    yPlane.rowStride, uPlane.rowStride, uPlane.pixelStride
                 )
                 val convLatency = System.currentTimeMillis() - convStart
+
+                // build bitmap from rgba bytes and rotate 90° to match display orientation
+                val rawBmp = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                rawBmp.copyPixelsFromBuffer(ByteBuffer.wrap(rgbaBytes))
+                val matrix = Matrix().apply { postRotate(90f) }
+                val bmp = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
+                rawBmp.recycle()
 
                 val procLatency = System.currentTimeMillis() - processingStart
                 val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
 
-                // post all metrics together for a single atomic recomposition
                 mainHandler.post {
                     currentFps          = fps
                     processingLatencyMs = procLatency
                     conversionLatencyMs = convLatency
                     endToEndLatencyMs   = e2eLatency
                     frameIntervalMs     = intervalMs
+                    processedBitmap     = bmp
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -207,24 +217,57 @@ fun CameraScreen() {
 
     Box(modifier = Modifier.fillMaxSize()) {
 
-        // textureview for live camera preview (classic view embedded in compose)
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-                val textureView = TextureView(ctx)
-                textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                    override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                        openCamera(ctx, st, imageReader, backgroundHandler,
-                            onCameraOpened   = { cameraDeviceRef[0]   = it },
-                            onSessionCreated = { captureSessionRef[0] = it })
+        // split view — top half raw preview, bottom half processed bitmap
+        Column(modifier = Modifier.fillMaxSize()) {
+
+            // top half — raw camera preview via textureview
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        val textureView = TextureView(ctx)
+                        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                                openCamera(ctx, st, imageReader, backgroundHandler,
+                                    onCameraOpened   = { cameraDeviceRef[0]   = it },
+                                    onSessionCreated = { captureSessionRef[0] = it })
+                            }
+                            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
+                            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                        }
+                        textureView
                     }
-                    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-                    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
-                    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-                }
-                textureView
+                )
+                // label for top half
+                Text(
+                    text = "RAW PREVIEW",
+                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp)
+                )
             }
-        )
+
+            // bottom half — processed rgba bitmap
+            Box(
+                modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                processedBitmap?.let { bitmap ->
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+                // label for bottom half
+                Text(
+                    text = "BASELINE",
+                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp)
+                )
+            }
+        }
 
         // semi-transparent hud pinned to top-left corner
         Column(
@@ -235,7 +278,6 @@ fun CameraScreen() {
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp)
         ) {
-            // colour-coded mode label — grey=baseline, blue=simd, green=gpu, yellow=hybrid
             Text("MODE: BASELINE", color = Color.Gray, fontSize = 13.sp, fontWeight = FontWeight.Bold)
 
             Text("FPS:  ${String.format("%.1f", currentFps)}", color = Color.White, fontSize = 13.sp)
