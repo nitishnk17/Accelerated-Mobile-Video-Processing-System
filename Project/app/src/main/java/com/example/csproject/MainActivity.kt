@@ -28,10 +28,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
@@ -44,6 +40,11 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.delay
 import java.io.File
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.material3.Divider
 
 // logcat tag — filter by "CSProject" in android studio
 private const val TAG = "CSProject"
@@ -111,12 +112,16 @@ fun CameraScreen() {
     var processingLatencyMs by remember { mutableStateOf(0L) }
     var conversionLatencyMs by remember { mutableStateOf(0L) }
     var sobelLatencyMs      by remember { mutableStateOf(0L) }
+    var jniLatencyMs        by remember { mutableStateOf(0L) }
     var endToEndLatencyMs   by remember { mutableStateOf(0L) }
     var cpuUsagePercent     by remember { mutableStateOf(0.0) }
     var frameIntervalMs     by remember { mutableStateOf(-1L) }
 
     // hold the latest rotated rgba bitmap for display
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var isSobelMode  by remember { mutableStateOf(true) }
+    var baselineBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
 
     // need a reference to the activity to call the jni method
     val activity = context as MainActivity
@@ -148,7 +153,6 @@ fun CameraScreen() {
             delay(500)
         }
     }
-
     DisposableEffect(Unit) {
         imageReader.setOnImageAvailableListener({ reader ->
             val frameArrivalTime = System.currentTimeMillis()
@@ -204,6 +208,13 @@ fun CameraScreen() {
                 val bmp = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
                 rawBmp.recycle()
 
+                // build baseline bitmap from rgba before edge detection
+                val rawBase=Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                rawBase.copyPixelsFromBuffer(ByteBuffer.wrap(rgbaBytes))
+                val baseBmp=Bitmap.createBitmap(rawBase,0,0,rawBase.width, rawBase.height, matrix, true)
+                rawBase.recycle()
+
+
                 val procLatency = System.currentTimeMillis() - processingStart
                 val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
 
@@ -212,9 +223,11 @@ fun CameraScreen() {
                     processingLatencyMs = procLatency
                     conversionLatencyMs = convLatency
                     sobelLatencyMs      = sobelLat
+                    jniLatencyMs        = convLatency + sobelLat
                     endToEndLatencyMs   = e2eLatency
                     frameIntervalMs     = intervalMs
                     processedBitmap     = bmp
+                    baselineBitmap      = baseBmp
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -229,58 +242,49 @@ fun CameraScreen() {
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(modifier = Modifier
+        .fillMaxSize()
+        .background(Color.Black)){
+        // hidden textureview - still needed to drive the camera pipeline
+        // size 0.dp makes it visible but still receives frames
 
-        // split view — top half raw preview, bottom half processed bitmap
-        Column(modifier = Modifier.fillMaxSize()) {
-
-            // top half — raw camera preview via textureview
-            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { ctx ->
-                        val textureView = TextureView(ctx)
-                        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                                openCamera(ctx, st, imageReader, backgroundHandler,
-                                    onCameraOpened   = { cameraDeviceRef[0]   = it },
-                                    onSessionCreated = { captureSessionRef[0] = it })
-                            }
-                            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-                            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
-                            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-                        }
-                        textureView
+        AndroidView(
+            modifier = Modifier.size(0.dp),
+            factory = { ctx ->
+                val textureView = TextureView(ctx)
+                textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                        openCamera(ctx, st, imageReader, backgroundHandler,
+                            onCameraOpened   = { cameraDeviceRef[0]   = it },
+                            onSessionCreated = { captureSessionRef[0] = it })
                     }
-                )
-                // label for top half
-                Text(
-                    text = "RAW PREVIEW",
-                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp)
-                )
-            }
-
-            // bottom half — processed rgba bitmap
-            Box(
-                modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black),
-                contentAlignment = Alignment.Center
-            ) {
-                processedBitmap?.let { bitmap ->
-                    Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = null,
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop
-                    )
+                    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
+                    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
                 }
-                // label for bottom half
-                Text(
-                    text = "SOBEL — BASELINE",
-                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp)
-                )
+                textureView
             }
+        )
+
+        // display bitmap based on current mode
+        val displayBitmap = if (isSobelMode) processedBitmap else baselineBitmap
+        displayBitmap?.let { bitmap ->
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+
+        // mode toggle button pinned to bottom center
+        Button(
+            onClick = { isSobelMode = !isSobelMode },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 24.dp)
+        ) {
+            Text(if (isSobelMode) "Switch to BASELINE" else "Switch to SOBEL")
         }
 
         // semi-transparent hud pinned to top-left corner
@@ -292,15 +296,23 @@ fun CameraScreen() {
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp)
         ) {
-            Text("MODE: BASELINE", color = Color.Gray, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            // mode header
+            Text(
+                text = if (isSobelMode) "MODE: SOBEL" else "MODE: BASELINE",
+                color = if (isSobelMode) Color.Cyan else Color.Gray,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold
+            )
 
-            Text("FPS:  ${String.format("%.1f", currentFps)}", color = Color.White, fontSize = 13.sp)
-            Text("Conv:  ${conversionLatencyMs} ms",           color = Color.White, fontSize = 13.sp)
-            Text("Sobel: ${sobelLatencyMs} ms",                color = Color.White, fontSize = 13.sp)
-            Text("Proc:  ${processingLatencyMs} ms",           color = Color.White, fontSize = 13.sp)
-            Text("E2E:   ${endToEndLatencyMs} ms",             color = Color.White, fontSize = 13.sp)
+            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
 
-            // turns yellow if interval > 40 ms (dropped frame at 30 fps)
+            //  performance
+            val fpsColor = when {
+                currentFps >= 25.0 -> Color.Green
+                currentFps >= 15.0 -> Color.Yellow
+                else               -> Color.Red
+            }
+            Text("FPS:  ${String.format("%.1f", currentFps)}", color = fpsColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+
             val intervalDisplay = if (frameIntervalMs < 0L) "--" else "${frameIntervalMs} ms"
             Text(
                 text  = "Intv: $intervalDisplay",
@@ -308,6 +320,17 @@ fun CameraScreen() {
                 fontSize = 13.sp
             )
 
+            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
+
+            // latency breakdown
+            Text("JNI:   ${jniLatencyMs} ms",          color = Color.Cyan,  fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Text("Conv:  ${conversionLatencyMs} ms",   color = Color.White, fontSize = 13.sp)
+            Text("Sobel: ${sobelLatencyMs} ms",        color = Color.White, fontSize = 13.sp)
+            Text("E2E:   ${endToEndLatencyMs} ms",     color = Color.White, fontSize = 13.sp)
+
+            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
+
+            // system
             Text("CPU:  ${String.format("%.1f", cpuUsagePercent)}%", color = Color.White, fontSize = 13.sp)
         }
     }
