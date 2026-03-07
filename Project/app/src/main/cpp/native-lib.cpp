@@ -3,6 +3,7 @@
 #include <jni.h>
 #include <string>
 #include <cmath>
+#include <arm_neon.h>
 #include <android/log.h>
 
 #define LOG_TAG "CSProject"
@@ -139,4 +140,68 @@ Java_com_example_csproject_MainActivity_nativeSobelFilter(
     env->ReleasePrimitiveArrayCritical(outArray, dst, 0);
 
     return outArray;
+}
+
+// convert rgba to grayscale precoessing 16 pixels at once
+// using vectors. result is grayscale stored back as rgba
+extern "C" JNIEXPORT jbyteArray JNICALL
+        Java_com_example_csproject_MainActivity_nativeGrayscaleNeon(
+                JNIEnv* env, jobject, jbyteArray rgbaInput, jint width, jint height){
+
+        int totalPixels=width*height;
+        jbyteArray outputArray=env->NewByteArray(totalPixels*4);
+
+        jbyte* src=(jbyte*)env->GetPrimitiveArrayCritical(rgbaInput, nullptr);
+        jbyte* dst=(jbyte*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
+
+        //adding weight for faster calculation
+        const uint8_t wR=77,wG=150, wB=29;
+
+        int i=0;
+        int limit=totalPixels-16;   //stop 16 pixels before end to avoid overread
+
+        //process 16 pixels at a time
+        for(;i<=limit;i+=16){
+            uint8_t* s=(uint8_t*)src+i*4;
+            uint8_t* d=(uint8_t*)dst+i*4;
+
+            //deinterleave rgba into sepeate r,g,b, a vectors 16 values each
+            uint8x16x4_t px = vld4q_u8(s);      // load 4 interleaved arrays of 16 uint8 values from address s
+
+            //compute: (r*77 + g*150 + b*29) >> 8
+            uint16x8_t lo = vmull_u8(vget_low_u8(px.val[0]),  vdup_n_u8(wR));
+            uint16x8_t hi = vmull_u8(vget_high_u8(px.val[0]), vdup_n_u8(wR));
+            lo = vmlal_u8(lo, vget_low_u8(px.val[1]),  vdup_n_u8(wG));
+            hi = vmlal_u8(hi, vget_high_u8(px.val[1]), vdup_n_u8(wG));
+            lo = vmlal_u8(lo, vget_low_u8(px.val[2]),  vdup_n_u8(wB));
+            hi = vmlal_u8(hi, vget_high_u8(px.val[2]), vdup_n_u8(wB));
+
+            // shift right by 8 and narrow back to uint8
+            uint8x8_t grayLo = vshrn_n_u16(lo, 8);
+            uint8x8_t grayHi = vshrn_n_u16(hi, 8);
+            uint8x16_t gray  = vcombine_u8(grayLo, grayHi);
+
+            // is vshrn_n_u16(lo, 8) — shift right by 8 (divides by 256) AND narrow from uint16 to uint8 in one instruction
+            // store grayscale value in R, G, B; keep alpha = 255
+            uint8x16x4_t out;
+            out.val[0] = gray;
+            out.val[1] = gray;
+            out.val[2] = gray;
+            out.val[3] = vdupq_n_u8(255);
+            vst4q_u8(d, out);
+        }
+
+        // handle remaining pixels (< 16) with scalar fallback
+        for (; i < totalPixels; i++) {
+            uint8_t* s = (uint8_t*)src + i * 4;
+            uint8_t* d = (uint8_t*)dst + i * 4;
+            uint8_t gray = (s[0]*77 + s[1]*150 + s[2]*29) >> 8;
+            d[0] = d[1] = d[2] = gray;
+            d[3] = 255;
+        }
+
+        env->ReleasePrimitiveArrayCritical(rgbaInput, src, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(outputArray,  dst, 0);
+
+        return outputArray;
 }

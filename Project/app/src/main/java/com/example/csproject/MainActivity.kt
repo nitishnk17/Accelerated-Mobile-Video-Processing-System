@@ -67,6 +67,11 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
+    // neon warm-up — grayscale using uint8x16_t vectors (16 pixels at once)
+    external fun nativeGrayscaleNeon(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
