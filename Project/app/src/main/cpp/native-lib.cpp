@@ -72,7 +72,7 @@ Java_com_example_csproject_MainActivity_nativeYuvToRgba(
 
 // helper — clamp an index so it stays inside the image bounds
 static inline int clampIdx(int val, int maxVal) {
-    if (val < 0)      return 0;
+    if (val < 0)       return 0;
     if (val >= maxVal) return maxVal - 1;
     return val;
 }
@@ -142,66 +142,253 @@ Java_com_example_csproject_MainActivity_nativeSobelFilter(
     return outArray;
 }
 
-// convert rgba to grayscale precoessing 16 pixels at once
-// using vectors. result is grayscale stored back as rgba
+// phase 2 stage 1 — neon grayscale warm-up
+// converts rgba to grayscale processing 16 pixels at once using neon vectors.
+// result is stored back as rgba (r=g=b=gray, a=255)
 extern "C" JNIEXPORT jbyteArray JNICALL
-        Java_com_example_csproject_MainActivity_nativeGrayscaleNeon(
-                JNIEnv* env, jobject, jbyteArray rgbaInput, jint width, jint height){
+Java_com_example_csproject_MainActivity_nativeGrayscaleNeon(
+        JNIEnv* env, jobject, jbyteArray rgbaInput, jint width, jint height) {
 
-        int totalPixels=width*height;
-        jbyteArray outputArray=env->NewByteArray(totalPixels*4);
+    int totalPixels = width * height;
+    jbyteArray outputArray = env->NewByteArray(totalPixels * 4);
 
-        jbyte* src=(jbyte*)env->GetPrimitiveArrayCritical(rgbaInput, nullptr);
-        jbyte* dst=(jbyte*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
+    jbyte* src = (jbyte*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
+    jbyte* dst = (jbyte*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
 
-        //adding weight for faster calculation
-        const uint8_t wR=77,wG=150, wB=29;
+    // integer weights that approximate the standard luma formula (r*0.299 + g*0.587 + b*0.114)
+    // scaled to sum ≈ 256 so we can divide by 256 with a single right-shift
+    const uint8_t weightR = 77, weightG = 150, weightB = 29;
 
-        int i=0;
-        int limit=totalPixels-16;   //stop 16 pixels before end to avoid overread
+    int pixelIndex = 0;
+    int neonLimit  = totalPixels - 16;  // stop 16 pixels before end to avoid overread
 
-        //process 16 pixels at a time
-        for(;i<=limit;i+=16){
-            uint8_t* s=(uint8_t*)src+i*4;
-            uint8_t* d=(uint8_t*)dst+i*4;
+    // process 16 pixels per iteration
+    for (; pixelIndex <= neonLimit; pixelIndex += 16) {
+        uint8_t* srcPixel = (uint8_t*)src + pixelIndex * 4;
+        uint8_t* dstPixel = (uint8_t*)dst + pixelIndex * 4;
 
-            //deinterleave rgba into sepeate r,g,b, a vectors 16 values each
-            uint8x16x4_t px = vld4q_u8(s);      // load 4 interleaved arrays of 16 uint8 values from address s
+        // load 16 rgba pixels and deinterleave into separate r, g, b, a vectors
+        uint8x16x4_t rgbaPixels = vld4q_u8(srcPixel);
 
-            //compute: (r*77 + g*150 + b*29) >> 8
-            uint16x8_t lo = vmull_u8(vget_low_u8(px.val[0]),  vdup_n_u8(wR));
-            uint16x8_t hi = vmull_u8(vget_high_u8(px.val[0]), vdup_n_u8(wR));
-            lo = vmlal_u8(lo, vget_low_u8(px.val[1]),  vdup_n_u8(wG));
-            hi = vmlal_u8(hi, vget_high_u8(px.val[1]), vdup_n_u8(wG));
-            lo = vmlal_u8(lo, vget_low_u8(px.val[2]),  vdup_n_u8(wB));
-            hi = vmlal_u8(hi, vget_high_u8(px.val[2]), vdup_n_u8(wB));
+        // compute luma = (r*77 + g*150 + b*29) >> 8  using 16-bit accumulators
+        // split into low (first 8) and high (last 8) to fit in uint16x8
+        uint16x8_t lumaLow  = vmull_u8(vget_low_u8(rgbaPixels.val[0]),  vdup_n_u8(weightR));
+        uint16x8_t lumaHigh = vmull_u8(vget_high_u8(rgbaPixels.val[0]), vdup_n_u8(weightR));
+        lumaLow  = vmlal_u8(lumaLow,  vget_low_u8(rgbaPixels.val[1]),  vdup_n_u8(weightG));
+        lumaHigh = vmlal_u8(lumaHigh, vget_high_u8(rgbaPixels.val[1]), vdup_n_u8(weightG));
+        lumaLow  = vmlal_u8(lumaLow,  vget_low_u8(rgbaPixels.val[2]),  vdup_n_u8(weightB));
+        lumaHigh = vmlal_u8(lumaHigh, vget_high_u8(rgbaPixels.val[2]), vdup_n_u8(weightB));
 
-            // shift right by 8 and narrow back to uint8
-            uint8x8_t grayLo = vshrn_n_u16(lo, 8);
-            uint8x8_t grayHi = vshrn_n_u16(hi, 8);
-            uint8x16_t gray  = vcombine_u8(grayLo, grayHi);
+        // shift right by 8 (÷256) and narrow back to uint8
+        uint8x8_t  grayLow  = vshrn_n_u16(lumaLow,  8);
+        uint8x8_t  grayHigh = vshrn_n_u16(lumaHigh, 8);
+        uint8x16_t grayVec  = vcombine_u8(grayLow, grayHigh);
 
-            // is vshrn_n_u16(lo, 8) — shift right by 8 (divides by 256) AND narrow from uint16 to uint8 in one instruction
-            // store grayscale value in R, G, B; keep alpha = 255
-            uint8x16x4_t out;
-            out.val[0] = gray;
-            out.val[1] = gray;
-            out.val[2] = gray;
-            out.val[3] = vdupq_n_u8(255);
-            vst4q_u8(d, out);
+        // store grayscale value in r, g, b; keep alpha = 255
+        uint8x16x4_t grayPixels;
+        grayPixels.val[0] = grayVec;
+        grayPixels.val[1] = grayVec;
+        grayPixels.val[2] = grayVec;
+        grayPixels.val[3] = vdupq_n_u8(255);
+        vst4q_u8(dstPixel, grayPixels);
+    }
+
+    //scalar fallback for any remaining pixels (< 16) at the end
+    for (; pixelIndex < totalPixels; pixelIndex++) {
+        uint8_t* srcPixel = (uint8_t*)src + pixelIndex * 4;
+        uint8_t* dstPixel = (uint8_t*)dst + pixelIndex * 4;
+        uint8_t gray = (srcPixel[0]*77 + srcPixel[1]*150 + srcPixel[2]*29) >> 8;
+        dstPixel[0] = dstPixel[1] = dstPixel[2] = gray;
+        dstPixel[3] = 255;
+    }
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput,   src, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outputArray, dst, 0);
+
+    return outputArray;
+}
+
+// phase 2 stage 2 — neon-accelerated sobel edge detection
+// processes r, g, b channels independently using the same 3x3 kernels as
+// nativeSobelFilter, so outputs can be compared for correctness
+//
+// speed -> inner loop handles 16 columns per iteration using 128-bit
+// neon registers instead of 1 column per iteration (scalar)
+//
+// magnitude approximation: |gx| + |gy|  (l1 norm) instead of sqrt(gx^2+gy^2)
+// removes all floating-point math; visually identical to sqrt on real frames
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_csproject_MainActivity_nativeSobelNeon(
+        JNIEnv* env, jobject,
+        jbyteArray rgbaInput, jint width, jint height) {
+
+    jbyteArray outputArray = env->NewByteArray(width * height * 4);
+
+    uint8_t* inputBuf  = (uint8_t*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
+    uint8_t* outputBuf = (uint8_t*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
+
+    for (int row = 0; row < height; row++) {
+
+        // output pointer for the current row
+        uint8_t* dstRow = outputBuf + row * width * 4;
+
+        // clamp row indices at top/bottom borders so the 3x3 window stays in-bounds
+        // (same clamping strategy as the scalar version)
+        int prevRowIdx = (row > 0)          ? row - 1 : 0;
+        int nextRowIdx = (row < height - 1) ? row + 1 : height - 1;
+        uint8_t* topRowPtr = inputBuf + prevRowIdx * width * 4;  // row above current
+        uint8_t* midRowPtr = inputBuf + row        * width * 4;  // current row
+        uint8_t* botRowPtr = inputBuf + nextRowIdx * width * 4;  // row below current
+
+        // left margin:  col - 1 >= 0  -> col >= 1
+        // right margin: col + 16 < width  ->  col + 16 <= width - 1
+        // so valid neon range is col = 1 .. (width - 17)
+        int col = 1;
+        for (; col + 16 <= width - 1; col += 16) {
+
+            // load 16 rgba pixels from each of the 8 neighbor positions in the 3x3 window.
+            // vld4q_u8 reads 64 bytes and deinterleaves into 4 channel vectors of 16 values each:
+            //   .val[0] = R for pixels [col-1 .. col+14]
+            //   .val[1] = G,  .val[2] = B,  .val[3] = A
+            uint8x16x4_t topLeft    = vld4q_u8(topRowPtr + (col - 1) * 4);
+            uint8x16x4_t topCenter  = vld4q_u8(topRowPtr +  col      * 4);
+            uint8x16x4_t topRight   = vld4q_u8(topRowPtr + (col + 1) * 4);
+            uint8x16x4_t midLeft    = vld4q_u8(midRowPtr + (col - 1) * 4);
+            // midCenter has kernel weight 0 in both gx and gy - no load needed
+            uint8x16x4_t midRight   = vld4q_u8(midRowPtr + (col + 1) * 4);
+            uint8x16x4_t botLeft    = vld4q_u8(botRowPtr + (col - 1) * 4);
+            uint8x16x4_t botCenter  = vld4q_u8(botRowPtr +  col      * 4);
+            uint8x16x4_t botRight   = vld4q_u8(botRowPtr + (col + 1) * 4);
+
+            // result container for this 16-pixel block alpha stays 255
+            uint8x16x4_t pixelResult;
+            pixelResult.val[3] = vdupq_n_u8(255);
+
+            // apply identical sobel math to each color channel (0=R, 1=G, 2=B)
+            for (int ch = 0; ch < 3; ch++) {
+
+                // extract this channel from each neighbor position (16 values each)
+                uint8x16_t tL = topLeft.val[ch];    // top-left
+                uint8x16_t tC = topCenter.val[ch];  // top-center
+                uint8x16_t tR = topRight.val[ch];   // top-right
+                uint8x16_t mL = midLeft.val[ch];    // mid-left
+                uint8x16_t mR = midRight.val[ch];   // mid-right
+                uint8x16_t bL = botLeft.val[ch];    // bot-left
+                uint8x16_t bC = botCenter.val[ch];  // bot-center
+                uint8x16_t bR = botRight.val[ch];   // bot-right
+
+                // gx = right_column − left_column
+                //  gx kernel:  [-1  0  +1]
+                //              [-2  0  +2]
+                //              [-1  0  +1]
+
+                // positive side (right column weights +1, +2, +1)
+                // vaddl_u8 widens uint8 → uint16 before adding to prevent overflow
+                uint16x8_t gxPosLow  = vaddl_u8(vget_low_u8(tR),  vget_low_u8(bR));
+                uint16x8_t gxPosHigh = vaddl_u8(vget_high_u8(tR), vget_high_u8(bR));
+                gxPosLow  = vmlal_u8(gxPosLow,  vget_low_u8(mR),  vdup_n_u8(2));  // += mR * 2
+                gxPosHigh = vmlal_u8(gxPosHigh, vget_high_u8(mR), vdup_n_u8(2));
+
+                // negative side (left column weights -1, -2, -1)
+                uint16x8_t gxNegLow  = vaddl_u8(vget_low_u8(tL),  vget_low_u8(bL));
+                uint16x8_t gxNegHigh = vaddl_u8(vget_high_u8(tL), vget_high_u8(bL));
+                gxNegLow  = vmlal_u8(gxNegLow,  vget_low_u8(mL),  vdup_n_u8(2));
+                gxNegHigh = vmlal_u8(gxNegHigh, vget_high_u8(mL), vdup_n_u8(2));
+
+                // |gx| = |positive_sum − negative_sum|  (vabdq avoids signed arithmetic)
+                uint16x8_t absGxLow  = vabdq_u16(gxPosLow,  gxNegLow);
+                uint16x8_t absGxHigh = vabdq_u16(gxPosHigh, gxNegHigh);
+
+                // gy = bottom_row − top_row
+                //  gy kernel:  [-1  -2  -1]
+                //              [ 0   0   0]
+                //              [+1  +2  +1]
+
+                // positive side (bottom row weights +1, +2, +1)
+                uint16x8_t gyPosLow  = vaddl_u8(vget_low_u8(bL),  vget_low_u8(bR));
+                uint16x8_t gyPosHigh = vaddl_u8(vget_high_u8(bL), vget_high_u8(bR));
+                gyPosLow  = vmlal_u8(gyPosLow,  vget_low_u8(bC),  vdup_n_u8(2));
+                gyPosHigh = vmlal_u8(gyPosHigh, vget_high_u8(bC), vdup_n_u8(2));
+
+                // negative side (top row weights -1, -2, -1)
+                uint16x8_t gyNegLow  = vaddl_u8(vget_low_u8(tL),  vget_low_u8(tR));
+                uint16x8_t gyNegHigh = vaddl_u8(vget_high_u8(tL), vget_high_u8(tR));
+                gyNegLow  = vmlal_u8(gyNegLow,  vget_low_u8(tC),  vdup_n_u8(2));
+                gyNegHigh = vmlal_u8(gyNegHigh, vget_high_u8(tC), vdup_n_u8(2));
+
+                // |gy|
+                uint16x8_t absGyLow  = vabdq_u16(gyPosLow,  gyNegLow);
+                uint16x8_t absGyHigh = vabdq_u16(gyPosHigh, gyNegHigh);
+
+                //  edge magnitude ~ |gx| + |gy|  (l1 norm, no sqrt needed)
+                // max l1 value = (255+510+255) + (255+510+255) = 2040
+                uint16x8_t magnitudeLow  = vaddq_u16(absGxLow,  absGyLow);
+                uint16x8_t magnitudeHigh = vaddq_u16(absGxHigh, absGyHigh);
+
+                // shift right 1 (÷2) -> max 1020; vqshrn_n_u16 shifts + narrows uint16 -> uint8
+                // + saturates any value above 255 to 255 automatically (no manual clamp needed)
+                uint8x8_t magLowByte  = vqshrn_n_u16(magnitudeLow,  1);
+                uint8x8_t magHighByte = vqshrn_n_u16(magnitudeHigh, 1);
+                pixelResult.val[ch]   = vcombine_u8(magLowByte, magHighByte);
+            }
+
+            // write 16 rgba pixels to output — vst4q_u8 re-interleaves the 4 channel vectors
+            // back into R0G0B0A0 R1G1B1A1 ... layout in memory
+            vst4q_u8(dstRow + col * 4, pixelResult);
         }
 
-        // handle remaining pixels (< 16) with scalar fallback
-        for (; i < totalPixels; i++) {
-            uint8_t* s = (uint8_t*)src + i * 4;
-            uint8_t* d = (uint8_t*)dst + i * 4;
-            uint8_t gray = (s[0]*77 + s[1]*150 + s[2]*29) >> 8;
-            d[0] = d[1] = d[2] = gray;
-            d[3] = 255;
-        }
+        // scalar fallback
+        // handles: left border (col=0), right border (col=width-1), and any
+        // leftover columns the neon loop didn't cover.
+        // uses the exact same 3x3 kernel + clampIdx as nativeSobelFilter so
+        // outputs are comparable during stage 3 correctness verification.
+        // 'col' already holds the first column the neon loop didn't reach.
+        auto scalarSobelAtCol = [&](int c) {
+            int gxR = 0, gyR = 0;
+            int gxG = 0, gyG = 0;
+            int gxB = 0, gyB = 0;
 
-        env->ReleasePrimitiveArrayCritical(rgbaInput, src, JNI_ABORT);
-        env->ReleasePrimitiveArrayCritical(outputArray,  dst, 0);
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int neighborRow = clampIdx(row + ky, height);
+                    int neighborCol = clampIdx(c   + kx, width);
+                    int pixelIdx    = (neighborRow * width + neighborCol) * 4;
 
-        return outputArray;
+                    int r = inputBuf[pixelIdx];
+                    int g = inputBuf[pixelIdx + 1];
+                    int b = inputBuf[pixelIdx + 2];
+
+                    // gx: left col gets weight -(1 or 2), right col gets +(1 or 2), center = 0
+                    int gxWeight = (kx == -1) ? -(ky == 0 ? 2 : 1)
+                                 : (kx ==  1) ?  (ky == 0 ? 2 : 1) : 0;
+                    // gy: top row gets weight -(1 or 2), bottom row gets +(1 or 2), center = 0
+                    int gyWeight = (ky == -1) ? -(kx == 0 ? 2 : 1)
+                                 : (ky ==  1) ?  (kx == 0 ? 2 : 1) : 0;
+
+                    gxR += r * gxWeight;  gyR += r * gyWeight;
+                    gxG += g * gxWeight;  gyG += g * gyWeight;
+                    gxB += b * gxWeight;  gyB += b * gyWeight;
+                }
+            }
+
+            int magR = (int)sqrtf((float)(gxR*gxR + gyR*gyR));
+            int magG = (int)sqrtf((float)(gxG*gxG + gyG*gyG));
+            int magB = (int)sqrtf((float)(gxB*gxB + gyB*gyB));
+
+            int outOffset = c * 4;
+            dstRow[outOffset]     = (uint8_t)(magR > 255 ? 255 : magR);
+            dstRow[outOffset + 1] = (uint8_t)(magG > 255 ? 255 : magG);
+            dstRow[outOffset + 2] = (uint8_t)(magB > 255 ? 255 : magB);
+            dstRow[outOffset + 3] = 255;
+        };
+
+        scalarSobelAtCol(0);                       // always handle left border with scalar
+        for (int c = col; c < width; c++)          // right border + any leftover columns
+            scalarSobelAtCol(c);
+    }
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput,   inputBuf,  JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outputArray, outputBuf, 0);
+
+    return outputArray;
 }

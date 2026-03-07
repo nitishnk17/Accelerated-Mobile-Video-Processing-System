@@ -72,6 +72,11 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
+    // phase 2 stage 2 — neon-accelerated sobel edge detection (16 pixels per iteration)
+    external fun nativeSobelNeon(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -124,8 +129,8 @@ fun CameraScreen() {
 
     // hold the latest rotated rgba bitmap for display
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var isSobelMode  by remember { mutableStateOf(true) }
-    var baselineBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var isSobelMode     by remember { mutableStateOf(true) }
+    var baselineBitmap  by remember { mutableStateOf<Bitmap?>(null) }
 
 
     // need a reference to the activity to call the jni method
@@ -199,11 +204,9 @@ fun CameraScreen() {
                 )
                 val convLatency = System.currentTimeMillis() - convStart
 
-                // run sobel edge detection on the rgba frame
+                // run scalar sobel edge detection on the rgba frame
                 val sobelStart = System.currentTimeMillis()
-                val edgeBytes = activity.nativeSobelFilter(
-                    rgbaBytes, image.width, image.height
-                )
+                val edgeBytes = activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
                 val sobelLat = System.currentTimeMillis() - sobelStart
 
                 // build bitmap from rgba bytes and rotate 90° to match display orientation
@@ -214,9 +217,9 @@ fun CameraScreen() {
                 rawBmp.recycle()
 
                 // build baseline bitmap from rgba before edge detection
-                val rawBase=Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                val rawBase = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
                 rawBase.copyPixelsFromBuffer(ByteBuffer.wrap(rgbaBytes))
-                val baseBmp=Bitmap.createBitmap(rawBase,0,0,rawBase.width, rawBase.height, matrix, true)
+                val baseBmp = Bitmap.createBitmap(rawBase, 0, 0, rawBase.width, rawBase.height, matrix, true)
                 rawBase.recycle()
 
 
