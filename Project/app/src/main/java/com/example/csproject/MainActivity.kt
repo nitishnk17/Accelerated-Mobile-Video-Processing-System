@@ -116,6 +116,13 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
+    // phase 4 stage 4 — times the image2D Sobel workgroup-size variants on the real
+    // device and latches the fastest one for subsequent nativeGpuSobel/nativeHybridSobel calls.
+    // returns a "GPU BENCH: ..." status string.
+    external fun nativeBenchmarkGpuVariants(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): String
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -194,6 +201,8 @@ fun CameraScreen() {
     var gpuInitResult by remember { mutableStateOf<String?>(null) }
     // phase 3 stage 3: did the gpu sobel pass or fail the correctness check
     var gpuSobelCheckResult by remember { mutableStateOf<String?>(null) }
+    // phase 4 stage 4 — workgroup-variant benchmark result ("GPU BENCH: ... -> NxN wins")
+    var gpuBenchResult by remember { mutableStateOf<String?>(null) }
     val gpuInitDone   = remember { booleanArrayOf(false) }  // run only once, on first frame
 
     // phase 4 stage 2 — pre-allocated buffers to eliminate per-frame GC pressure
@@ -329,6 +338,13 @@ fun CameraScreen() {
 
                     // only bother checking sobel correctness if the ssbo pipeline itself works
                     if (verifyMsg.startsWith("GPU PASS")) {
+                        // phase 4 stage 4 — race the image2D sobel workgroup variants before
+                        // correctness verification runs, so whatever verify passes/fails on is
+                        // the exact variant the live pipeline will dispatch for every subsequent frame
+                        val benchMsg = activity.nativeBenchmarkGpuVariants(rgbaBytes, image.width, image.height)
+                        Log.d(TAG, "gpu bench: $benchMsg")
+                        mainHandler.post { gpuBenchResult = benchMsg }
+
                         val sobelVerify = activity.nativeVerifyGpuSobel(rgbaBytes, image.width, image.height)
                         Log.d(TAG, "gpu sobel verify: $sobelVerify")
                         mainHandler.post { gpuSobelCheckResult = sobelVerify }
@@ -540,6 +556,16 @@ fun CameraScreen() {
                 Text(
                     if (ok) "GPU Sobel: PASS " else "GPU Sobel: FAIL ",
                     color = if (ok) Color.Green else Color.Red,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
+
+            // phase 4 stage 4 — winning workgroup size from the on-device benchmark
+            gpuBenchResult?.let {
+                val winner = it.substringAfterLast("-> ").removeSuffix(" wins")
+                Text(
+                    "GPU WG:   $winner",
+                    color = Color(0xFFFF9800),
                     fontSize = 13.sp, fontWeight = FontWeight.Bold
                 )
             }
