@@ -392,3 +392,84 @@ Java_com_example_csproject_MainActivity_nativeSobelNeon(
 
     return outputArray;
 }
+
+// phase 2 stage 3 — verify neon sobel against a scalar reference
+// runs the neon function, then independently calculates the L1/2 sobel formula
+// on-the-fly for interior pixels and compares them. we skip the border columns
+// because the neon implementation uses a different fallback formula (sqrtf) there.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_csproject_MainActivity_nativeVerifySobelCorrectness(
+        JNIEnv* env, jobject thiz,
+        jbyteArray rgbaInput, jint width, jint height) {
+
+    // run the neon path first to get the output we want to verify
+    jbyteArray neonResult = Java_com_example_csproject_MainActivity_nativeSobelNeon(
+            env, thiz, rgbaInput, width, height);
+
+    uint8_t* src     = (uint8_t*)env->GetPrimitiveArrayCritical(rgbaInput,  nullptr);
+    uint8_t* neonBuf = (uint8_t*)env->GetPrimitiveArrayCritical(neonResult, nullptr);
+
+    // figure out where the neon vectorized loop stops natively
+    int neonEnd = 1;
+    while (neonEnd + 16 <= width - 1) neonEnd += 16;
+
+    int mismatches = 0, worst = 0, checked = 0;
+
+    // single pass: compute reference math and compare immediately.
+    // we only check the interior region that the neon loop actually processed.
+    for (int r = 0; r < height; r++) {
+        int rUp   = r > 0          ? r - 1 : 0;
+        int rDown = r < height - 1 ? r + 1 : height - 1;
+
+        for (int c = 1; c < neonEnd; c++) {
+            int cL = c - 1; // safe since c >= 1
+            int cR = c + 1; // safe since c < neonEnd <= width-1
+            int out = (r * width + c) * 4;
+
+            for (int ch = 0; ch < 3; ch++) {
+                int tL = src[(rUp   * width + cL) * 4 + ch];
+                int tC = src[(rUp   * width + c)  * 4 + ch];
+                int tR = src[(rUp   * width + cR) * 4 + ch];
+                int mL = src[(r     * width + cL) * 4 + ch];
+                int mR = src[(r     * width + cR) * 4 + ch];
+                int bL = src[(rDown * width + cL) * 4 + ch];
+                int bC = src[(rDown * width + c)  * 4 + ch];
+                int bR = src[(rDown * width + cR) * 4 + ch];
+
+                int gxPos = tR + 2*mR + bR;
+                int gxNeg = tL + 2*mL + bL;
+                int gyPos = bL + 2*bC + bR;
+                int gyNeg = tL + 2*tC + tR;
+
+                int absGx = gxPos > gxNeg ? gxPos - gxNeg : gxNeg - gxPos;
+                int absGy = gyPos > gyNeg ? gyPos - gyNeg : gyNeg - gyPos;
+
+                int mag = (absGx + absGy) >> 1;
+                uint8_t refMag = (uint8_t)(mag > 255 ? 255 : mag);
+
+                int diff = (int)refMag - (int)neonBuf[out + ch];
+                if (diff < 0) diff = -diff;
+
+                if (diff > 1) {
+                    mismatches++;
+                    if (diff > worst) worst = diff;
+                }
+                checked++;
+            }
+        }
+    }
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput,  src,     JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(neonResult, neonBuf, JNI_ABORT);
+
+    char msg[256];
+    if (mismatches == 0) {
+        snprintf(msg, sizeof(msg), "PASS: 0 mismatches out of %d", checked);
+        LOGI("neon verification passed — %d channels checked, all within ±1", checked);
+    } else {
+        snprintf(msg, sizeof(msg), "FAIL: %d mismatches (max diff=%d) out of %d",
+                 mismatches, worst, checked);
+        LOGI("neon verification failed — %d mismatches, worst diff=%d", mismatches, worst);
+    }
+    return env->NewStringUTF(msg);
+}

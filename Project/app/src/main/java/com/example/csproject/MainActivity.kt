@@ -77,6 +77,11 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
+    // stage 3 — compares neon sobel output against a scalar reference, returns "PASS: ..." / "FAIL: ..."
+    external fun nativeVerifySobelCorrectness(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): String
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -128,9 +133,10 @@ fun CameraScreen() {
     var frameIntervalMs     by remember { mutableStateOf(-1L) }
 
     // hold the latest rotated rgba bitmap for display
-    var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var isSobelMode     by remember { mutableStateOf(true) }
-    var baselineBitmap  by remember { mutableStateOf<Bitmap?>(null) }
+    var processedBitmap    by remember { mutableStateOf<Bitmap?>(null) }
+    var isSobelMode        by remember { mutableStateOf(true) }
+    var baselineBitmap     by remember { mutableStateOf<Bitmap?>(null) }
+    var simdCheckResult    by remember { mutableStateOf<String?>(null) }
 
 
     // need a reference to the activity to call the jni method
@@ -155,6 +161,7 @@ fun CameraScreen() {
 
     // previous frame hardware timestamp (ns); longarray lets the lambda mutate it
     val lastHwTimestampNs = remember { longArrayOf(-1L) }
+    val verifyOnce = remember { booleanArrayOf(false) }  // run neon check on first frame only
 
     // poll cpu usage every ~1 s from /proc/stat
     LaunchedEffect(Unit) {
@@ -203,6 +210,14 @@ fun CameraScreen() {
                     yPlane.rowStride, uPlane.rowStride, uPlane.pixelStride
                 )
                 val convLatency = System.currentTimeMillis() - convStart
+
+                // stage 3 — one-shot neon correctness check on the first frame
+                if (!verifyOnce[0]) {
+                    verifyOnce[0] = true
+                    val result = activity.nativeVerifySobelCorrectness(rgbaBytes, image.width, image.height)
+                    Log.d(TAG, "simd check: $result")
+                    mainHandler.post { simdCheckResult = result }
+                }
 
                 // run scalar sobel edge detection on the rgba frame
                 val sobelStart = System.currentTimeMillis()
@@ -335,6 +350,18 @@ fun CameraScreen() {
             Text("Conv:  ${conversionLatencyMs} ms",   color = Color.White, fontSize = 13.sp)
             Text("Sobel: ${sobelLatencyMs} ms",        color = Color.White, fontSize = 13.sp)
             Text("E2E:   ${endToEndLatencyMs} ms",     color = Color.White, fontSize = 13.sp)
+
+            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
+
+            // neon verification badge
+            simdCheckResult?.let {
+                val ok = it.startsWith("PASS")
+                Text(
+                    if (ok) "SIMD: PASS \u2713" else "SIMD: FAIL \u2717",
+                    color = if (ok) Color.Green else Color.Red,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
 
             Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
 
