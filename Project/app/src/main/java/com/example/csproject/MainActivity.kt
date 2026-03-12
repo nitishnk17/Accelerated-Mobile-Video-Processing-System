@@ -67,6 +67,21 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
+    // neon warm-up — grayscale using uint8x16_t vectors (16 pixels at once)
+    external fun nativeGrayscaleNeon(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
+
+    // phase 2 stage 2 — neon-accelerated sobel edge detection (16 pixels per iteration)
+    external fun nativeSobelNeon(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
+
+    // phase 2 stage 3 — compares neon sobel output against a scalar reference, returns "PASS: ..." / "FAIL: ..."
+    external fun nativeVerifySobelCorrectness(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): String
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -119,8 +134,12 @@ fun CameraScreen() {
 
     // hold the latest rotated rgba bitmap for display
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var isSobelMode  by remember { mutableStateOf(true) }
-    var baselineBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var useSimd         by remember { mutableStateOf(false) }  // phase 2 stage 4 — false=Baseline, true=SIMD
+    var simdCheckResult by remember { mutableStateOf<String?>(null) }
+
+    // phase 2 stage 5 — track sobel latency per mode to compute speedup ratio
+    var baselineSobelMs by remember { mutableStateOf(0L) }
+    var neonSobelMs     by remember { mutableStateOf(0L) }
 
 
     // need a reference to the activity to call the jni method
@@ -145,6 +164,7 @@ fun CameraScreen() {
 
     // previous frame hardware timestamp (ns); longarray lets the lambda mutate it
     val lastHwTimestampNs = remember { longArrayOf(-1L) }
+    val verifyOnce = remember { booleanArrayOf(false) }  // run neon check on first frame only
 
     // poll cpu usage every ~1 s from /proc/stat
     LaunchedEffect(Unit) {
@@ -194,11 +214,20 @@ fun CameraScreen() {
                 )
                 val convLatency = System.currentTimeMillis() - convStart
 
-                // run sobel edge detection on the rgba frame
+                // phase 2 stage 3 — one shot neon correctness check on the first frame
+                if (!verifyOnce[0]) {
+                    verifyOnce[0] = true
+                    val result = activity.nativeVerifySobelCorrectness(rgbaBytes, image.width, image.height)
+                    Log.d(TAG, "simd check: $result")
+                    mainHandler.post { simdCheckResult = result }
+                }
+
+                // phase 2 stage 4 — route to neon or scalar based on toggle
                 val sobelStart = System.currentTimeMillis()
-                val edgeBytes = activity.nativeSobelFilter(
-                    rgbaBytes, image.width, image.height
-                )
+                val edgeBytes = if (useSimd)
+                    activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
+                else
+                    activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
                 val sobelLat = System.currentTimeMillis() - sobelStart
 
                 // build bitmap from rgba bytes and rotate 90° to match display orientation
@@ -207,13 +236,6 @@ fun CameraScreen() {
                 val matrix = Matrix().apply { postRotate(90f) }
                 val bmp = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
                 rawBmp.recycle()
-
-                // build baseline bitmap from rgba before edge detection
-                val rawBase=Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
-                rawBase.copyPixelsFromBuffer(ByteBuffer.wrap(rgbaBytes))
-                val baseBmp=Bitmap.createBitmap(rawBase,0,0,rawBase.width, rawBase.height, matrix, true)
-                rawBase.recycle()
-
 
                 val procLatency = System.currentTimeMillis() - processingStart
                 val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
@@ -227,7 +249,8 @@ fun CameraScreen() {
                     endToEndLatencyMs   = e2eLatency
                     frameIntervalMs     = intervalMs
                     processedBitmap     = bmp
-                    baselineBitmap      = baseBmp
+                    // phase 2 stage 5 — store latency per mode for speedup ratio
+                    if (useSimd) neonSobelMs = sobelLat else baselineSobelMs = sobelLat
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -266,9 +289,8 @@ fun CameraScreen() {
             }
         )
 
-        // display bitmap based on current mode
-        val displayBitmap = if (isSobelMode) processedBitmap else baselineBitmap
-        displayBitmap?.let { bitmap ->
+        // display the edge-detected frame (whichever sobel path is active)
+        processedBitmap?.let { bitmap ->
             Image(
                 bitmap = bitmap.asImageBitmap(),
                 contentDescription = null,
@@ -277,14 +299,14 @@ fun CameraScreen() {
             )
         }
 
-        // mode toggle button pinned to bottom center
+        // phase 2 stage 4 — toggle between scalar baseline and neon simd
         Button(
-            onClick = { isSobelMode = !isSobelMode },
+            onClick = { useSimd = !useSimd },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 24.dp)
         ) {
-            Text(if (isSobelMode) "Switch to BASELINE" else "Switch to SOBEL")
+            Text(if (useSimd) "Switch to Baseline" else "Switch to SIMD")
         }
 
         // semi-transparent hud pinned to top-left corner
@@ -298,8 +320,8 @@ fun CameraScreen() {
         ) {
             // mode header
             Text(
-                text = if (isSobelMode) "MODE: SOBEL" else "MODE: BASELINE",
-                color = if (isSobelMode) Color.Cyan else Color.Gray,
+                text = if (useSimd) "MODE: SIMD" else "MODE: Baseline",
+                color = if (useSimd) Color.Green else Color.Cyan,
                 fontSize = 13.sp, fontWeight = FontWeight.Bold
             )
 
@@ -327,6 +349,31 @@ fun CameraScreen() {
             Text("Conv:  ${conversionLatencyMs} ms",   color = Color.White, fontSize = 13.sp)
             Text("Sobel: ${sobelLatencyMs} ms",        color = Color.White, fontSize = 13.sp)
             Text("E2E:   ${endToEndLatencyMs} ms",     color = Color.White, fontSize = 13.sp)
+
+            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
+
+            // neon verification badge
+            simdCheckResult?.let {
+                val ok = it.startsWith("PASS")
+                Text(
+                    if (ok) "SIMD: PASS " else "SIMD: FAIL ",
+                    color = if (ok) Color.Green else Color.Red,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
+
+            // phase 2 stage 5 — speedup ratio (shown once both modes have been sampled)
+            if (baselineSobelMs > 0 && neonSobelMs > 0) {
+                Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
+                Text("Base:  ${baselineSobelMs} ms", color = Color.Cyan,  fontSize = 13.sp)
+                Text("NEON:  ${neonSobelMs} ms",     color = Color.Green, fontSize = 13.sp)
+                val ratio = baselineSobelMs.toDouble() / neonSobelMs.toDouble()
+                Text(
+                    text = "Speedup: ${String.format("%.1f", ratio)}×",
+                    color = Color.Yellow,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
 
             Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
 
