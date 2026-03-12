@@ -2,7 +2,6 @@
 
 #include <jni.h>
 #include <string>
-#include <cmath>
 #include <arm_neon.h>
 #include <android/log.h>
 
@@ -78,6 +77,8 @@ static inline int clampIdx(int val, int maxVal) {
 }
 
 // applies a 3x3 sobel filter on the rgba buffer (r, g, b processed independently)
+// magnitude formula: (|gx| + |gy|) >> 1  (l1/2 norm — same formula used by the
+// neon and gpu paths so all modes produce functionally equivalent output)
 // produces bright edges on a dark background; alpha stays 255
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_example_csproject_MainActivity_nativeSobelFilter(
@@ -124,9 +125,12 @@ Java_com_example_csproject_MainActivity_nativeSobelFilter(
                 }
             }
 
-            int mR = (int)sqrtf((float)(gxR * gxR + gyR * gyR));
-            int mG = (int)sqrtf((float)(gxG * gxG + gyG * gyG));
-            int mB = (int)sqrtf((float)(gxB * gxB + gyB * gyB));
+            int absGxR = gxR < 0 ? -gxR : gxR,  absGyR = gyR < 0 ? -gyR : gyR;
+            int absGxG = gxG < 0 ? -gxG : gxG,  absGyG = gyG < 0 ? -gyG : gyG;
+            int absGxB = gxB < 0 ? -gxB : gxB,  absGyB = gyB < 0 ? -gyB : gyB;
+            int mR = (absGxR + absGyR) >> 1;
+            int mG = (absGxG + absGyG) >> 1;
+            int mB = (absGxB + absGyB) >> 1;
 
             int out = (row * width + col) * 4;
             dst[out]     = (jbyte)(mR > 255 ? 255 : mR);
@@ -340,8 +344,8 @@ Java_com_example_csproject_MainActivity_nativeSobelNeon(
         // scalar fallback
         // handles: left border (col=0), right border (col=width-1), and any
         // leftover columns the neon loop didn't cover.
-        // uses the exact same 3x3 kernel + clampIdx as nativeSobelFilter so
-        // outputs are comparable during stage 3 correctness verification.
+        // uses the same L1/2 magnitude formula as the neon path — (|gx|+|gy|)>>1 —
+        // so the output is visually consistent across the entire frame.
         // 'col' already holds the first column the neon loop didn't reach.
         auto scalarSobelAtCol = [&](int c) {
             int gxR = 0, gyR = 0;
@@ -371,9 +375,13 @@ Java_com_example_csproject_MainActivity_nativeSobelNeon(
                 }
             }
 
-            int magR = (int)sqrtf((float)(gxR*gxR + gyR*gyR));
-            int magG = (int)sqrtf((float)(gxG*gxG + gyG*gyG));
-            int magB = (int)sqrtf((float)(gxB*gxB + gyB*gyB));
+            // L1/2 norm — matches the neon path exactly; no sqrtf needed
+            int absGxR = gxR < 0 ? -gxR : gxR,  absGyR = gyR < 0 ? -gyR : gyR;
+            int absGxG = gxG < 0 ? -gxG : gxG,  absGyG = gyG < 0 ? -gyG : gyG;
+            int absGxB = gxB < 0 ? -gxB : gxB,  absGyB = gyB < 0 ? -gyB : gyB;
+            int magR = (absGxR + absGyR) >> 1;
+            int magG = (absGxG + absGyG) >> 1;
+            int magB = (absGxB + absGyB) >> 1;
 
             int outOffset = c * 4;
             dstRow[outOffset]     = (uint8_t)(magR > 255 ? 255 : magR);
@@ -393,10 +401,12 @@ Java_com_example_csproject_MainActivity_nativeSobelNeon(
     return outputArray;
 }
 
-// phase 2 stage 3 — verify neon sobel against a scalar reference
-// runs the neon function, then independently calculates the L1/2 sobel formula
-// on-the-fly for interior pixels and compares them. we skip the border columns
-// because the neon implementation uses a different fallback formula (sqrtf) there.
+// phase 2 stage 3 — verify neon sobel correctness
+// runs the neon function, then independently recalculates the L1/2 formula
+// (|gx|+|gy|)>>1 for interior pixels and compares them against the neon output.
+// only interior columns (1 .. neonEnd-1) are checked — the same region the neon
+// vectorized loop processed. border columns are skipped because they are handled
+// by the scalar fallback path, which is trivially correct by inspection.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_csproject_MainActivity_nativeVerifySobelCorrectness(
         JNIEnv* env, jobject thiz,
@@ -461,6 +471,7 @@ Java_com_example_csproject_MainActivity_nativeVerifySobelCorrectness(
 
     env->ReleasePrimitiveArrayCritical(rgbaInput,  src,     JNI_ABORT);
     env->ReleasePrimitiveArrayCritical(neonResult, neonBuf, JNI_ABORT);
+    env->DeleteLocalRef(neonResult);  // release local reference to avoid table exhaustion
 
     char msg[256];
     if (mismatches == 0) {

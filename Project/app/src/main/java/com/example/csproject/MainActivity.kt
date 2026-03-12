@@ -137,6 +137,10 @@ fun CameraScreen() {
     var useSimd         by remember { mutableStateOf(false) }  // phase 2 stage 4 — false=Baseline, true=SIMD
     var simdCheckResult by remember { mutableStateOf<String?>(null) }
 
+    // phase 2 stage 5 — track sobel latency per mode to compute speedup ratio
+    var baselineSobelMs by remember { mutableStateOf(0L) }
+    var neonSobelMs     by remember { mutableStateOf(0L) }
+
 
     // need a reference to the activity to call the jni method
     val activity = context as MainActivity
@@ -245,6 +249,8 @@ fun CameraScreen() {
                     endToEndLatencyMs   = e2eLatency
                     frameIntervalMs     = intervalMs
                     processedBitmap     = bmp
+                    // phase 2 stage 5 — store latency per mode for speedup ratio
+                    if (useSimd) neonSobelMs = sobelLat else baselineSobelMs = sobelLat
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -350,8 +356,21 @@ fun CameraScreen() {
             simdCheckResult?.let {
                 val ok = it.startsWith("PASS")
                 Text(
-                    if (ok) "SIMD: PASS \u2713" else "SIMD: FAIL \u2717",
+                    if (ok) "SIMD: PASS " else "SIMD: FAIL ",
                     color = if (ok) Color.Green else Color.Red,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
+
+            // phase 2 stage 5 — speedup ratio (shown once both modes have been sampled)
+            if (baselineSobelMs > 0 && neonSobelMs > 0) {
+                Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
+                Text("Base:  ${baselineSobelMs} ms", color = Color.Cyan,  fontSize = 13.sp)
+                Text("NEON:  ${neonSobelMs} ms",     color = Color.Green, fontSize = 13.sp)
+                val ratio = baselineSobelMs.toDouble() / neonSobelMs.toDouble()
+                Text(
+                    text = "Speedup: ${String.format("%.1f", ratio)}×",
+                    color = Color.Yellow,
                     fontSize = 13.sp, fontWeight = FontWeight.Bold
                 )
             }
