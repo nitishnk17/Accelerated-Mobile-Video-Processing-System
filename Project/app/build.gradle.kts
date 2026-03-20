@@ -19,11 +19,12 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        //tells NDK which cpu architrcture to compile c++ code for without this gradle builds for every architecture
-        // which makes the build slow and the apk unnecessarily large
-        //arm64-v8a used in all modern android phones ie 64bit arm chips
+        // tells NDK which cpu architecture to compile c++ code for; without this gradle builds for every
+        // architecture which makes the build slow and the apk unnecessarily large.
+        // arm64-v8a covers all modern 64-bit android phones and is required for arm neon intrinsics.
+        // x86_64 (emulator) is excluded because arm_neon.h is not available on that target.
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
 
         //passes the compiler flags to the cmake build that compiles the c++ files using c++17 standard which we will use in NEON SIMD and GPU shader code
