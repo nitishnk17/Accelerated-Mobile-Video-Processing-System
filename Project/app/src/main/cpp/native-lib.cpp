@@ -1,9 +1,16 @@
-// native-lib.cpp — jni bridge between kotlin and c++
+// native-libcpp — jni bridge between kotlin and c++
 
 #include <jni.h>
 #include <string>
+#include <cstring>
 #include <arm_neon.h>
 #include <android/log.h>
+
+// phase 3 stage 1 — headless EGL context + OpenGL ES 3.1 compute shaders
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl3.h>
+#include <GLES3/gl31.h>
 
 #define LOG_TAG "CSProject"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -250,10 +257,10 @@ Java_com_example_csproject_MainActivity_nativeSobelNeon(
         int col = 1;
         for (; col + 16 <= width - 1; col += 16) {
 
-            // load 16 rgba pixels from each of the 8 neighbor positions in the 3x3 window.
+            // load 16 rgba pixels from each of the 8 neighbor positions in the 3x3 window
             // vld4q_u8 reads 64 bytes and deinterleaves into 4 channel vectors of 16 values each:
-            //   .val[0] = R for pixels [col-1 .. col+14]
-            //   .val[1] = G,  .val[2] = B,  .val[3] = A
+            //   val[0] = R for pixels [col-1  col+14]
+            //   val[1] = G,  val[2] = B,  val[3] = A
             uint8x16x4_t topLeft    = vld4q_u8(topRowPtr + (col - 1) * 4);
             uint8x16x4_t topCenter  = vld4q_u8(topRowPtr +  col      * 4);
             uint8x16x4_t topRight   = vld4q_u8(topRowPtr + (col + 1) * 4);
@@ -481,6 +488,272 @@ Java_com_example_csproject_MainActivity_nativeVerifySobelCorrectness(
         snprintf(msg, sizeof(msg), "FAIL: %d mismatches (max diff=%d) out of %d",
                  mismatches, worst, checked);
         LOGI("neon verification failed — %d mismatches, worst diff=%d", mismatches, worst);
+    }
+    return env->NewStringUTF(msg);
+}
+
+// phase 3 stage 1 — headless EGL context + pass-through compute shader
+// global EGL state — initialized once on the processing thread, reused every frame
+static EGLDisplay g_eglDisplay = EGL_NO_DISPLAY;
+static EGLContext g_eglContext = EGL_NO_CONTEXT;
+static EGLSurface g_eglSurface = EGL_NO_SURFACE;  // 1×1 pbuffer (needed to make context current)
+
+// compiled pass-through compute shader program handle
+static GLuint g_passthroughProgram = 0;
+
+// helper: compile a single compute shader from GLSL source and link it into a program
+// returns the program id on success, 0 on any error (details logged to logcat)
+static GLuint compileComputeProgram(const char* source) {
+    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char buf[512];
+        glGetShaderInfoLog(shader, sizeof(buf), nullptr, buf);
+        LOGI("compute shader compile error: %s", buf);
+        glDeleteShader(shader);
+        return 0;
+    }
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, shader);
+    glLinkProgram(prog);
+    glDeleteShader(shader);  // shader object no longer needed after linking
+
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char buf[512];
+        glGetProgramInfoLog(prog, sizeof(buf), nullptr, buf);
+        LOGI("compute program link error: %s", buf);
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
+// pass-through compute shader (OpenGL ES 3.1 GLSL)
+// each invocation handles one pixel; pixel layout in the SSBOs is one uint per pixel (4 bytes = RGBA)
+// workgroup size 16×16 matches the dispatch call in nativeGpuPassThrough
+static const char* PASSTHROUGH_SHADER_SRC = R"(#version 310 es
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuffer  { uint inputData[];  };
+layout(std430, binding = 1) writeonly buffer OutputBuffer { uint outputData[]; };
+
+uniform int uWidth;
+uniform int uHeight;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= uint(uWidth) || y >= uint(uHeight)) return;
+    uint idx = y * uint(uWidth) + x;
+    outputData[idx] = inputData[idx];  // copy pixel unchanged
+}
+)";
+
+// initializes a headless EGL context bound to the calling thread.
+// must be called on the same thread that will later call nativeGpuPassThrough.
+// returns "GPU OK — EGL <major>.<minor>, compute shader compiled" on success
+// or a "GPU FAIL: <reason>" string describing what step failed.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_csproject_MainActivity_nativeInitGpu(JNIEnv* env, jobject) {
+
+    // skip reinit if already set up (guard against multiple calls)
+    if (g_eglContext != EGL_NO_CONTEXT) {
+        return env->NewStringUTF("GPU OK — already initialized");
+    }
+
+    // step 1 — obtain the default EGL display connection
+    g_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (g_eglDisplay == EGL_NO_DISPLAY) {
+        return env->NewStringUTF("GPU FAIL: eglGetDisplay returned NO_DISPLAY");
+    }
+
+    // step 2 — initialize EGL on this display
+    EGLint major = 0, minor = 0;
+    if (!eglInitialize(g_eglDisplay, &major, &minor)) {
+        return env->NewStringUTF("GPU FAIL: eglInitialize failed");
+    }
+    LOGI("EGL version %d.%d", major, minor);
+
+    // step 3 — choose a config that supports OpenGL ES 3.x and pbuffer surfaces
+    const EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+        EGL_RED_SIZE,   8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE,  8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs = 0;
+    if (!eglChooseConfig(g_eglDisplay, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        return env->NewStringUTF("GPU FAIL: eglChooseConfig found no suitable config (ES 3.x not supported?)");
+    }
+
+    // step 4 — bind the OpenGL ES API
+    eglBindAPI(EGL_OPENGL_ES_API);
+
+    // step 5 — create an OpenGL ES 3.1 context (compute shaders require ES 3.1)
+    const EGLint contextAttribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        EGL_NONE
+    };
+    g_eglContext = eglCreateContext(g_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
+    if (g_eglContext == EGL_NO_CONTEXT) {
+        return env->NewStringUTF("GPU FAIL: eglCreateContext failed — device may not support ES 3.1");
+    }
+
+    // step 6 — create a minimal 1×1 pbuffer surface so we can call eglMakeCurrent
+    // (a surface is required even though we only do off-screen compute work)
+    const EGLint pbufferAttribs[] = {
+        EGL_WIDTH,  1,
+        EGL_HEIGHT, 1,
+        EGL_NONE
+    };
+    g_eglSurface = eglCreatePbufferSurface(g_eglDisplay, config, pbufferAttribs);
+    if (g_eglSurface == EGL_NO_SURFACE) {
+        return env->NewStringUTF("GPU FAIL: eglCreatePbufferSurface failed");
+    }
+
+    // step 7 — make the context current on this thread
+    if (!eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext)) {
+        return env->NewStringUTF("GPU FAIL: eglMakeCurrent failed");
+    }
+
+    // step 8 — compile and link the pass-through compute shader
+    g_passthroughProgram = compileComputeProgram(PASSTHROUGH_SHADER_SRC);
+    if (g_passthroughProgram == 0) {
+        return env->NewStringUTF("GPU FAIL: pass-through compute shader failed to compile");
+    }
+
+    LOGI("GPU init success — EGL %d.%d, pass-through compute shader ready", major, minor);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "GPU OK — EGL %d.%d, compute shader compiled", major, minor);
+    return env->NewStringUTF(msg);
+}
+
+// runs the pass-through compute shader on the input rgba buffer via SSBOs.
+// uploads input to the GPU, dispatches 16×16 workgroups, reads back the output
+// returns the copied data as a bytearray; returns an empty array if GPU is not initialized
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_csproject_MainActivity_nativeGpuPassThrough(
+        JNIEnv* env, jobject,
+        jbyteArray rgbaInput, jint width, jint height) {
+
+    int totalBytes = width * height * 4;
+
+    // allocate output array before acquiring the critical pointer
+    jbyteArray outputArray = env->NewByteArray(totalBytes);
+
+    if (g_passthroughProgram == 0 || g_eglContext == EGL_NO_CONTEXT) {
+        LOGI("nativeGpuPassThrough called before GPU init — returning zeroed buffer");
+        return outputArray;
+    }
+
+    // pin the java byte arrays so we can pass the raw pointers to OpenGL
+    jbyte* srcBytes = (jbyte*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
+    jbyte* dstBytes = (jbyte*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
+
+    // upload input to an SSBO at binding point 0
+    GLuint ssboIn = 0, ssboOut = 0;
+    glGenBuffers(1, &ssboIn);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboIn);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, srcBytes, GL_STATIC_READ);
+
+    // create output SSBO at binding point 1 (empty, same size)
+    glGenBuffers(1, &ssboOut);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_STATIC_COPY);
+
+    // dispatch the pass-through shader
+    glUseProgram(g_passthroughProgram);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboIn);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboOut);
+
+    GLint locW = glGetUniformLocation(g_passthroughProgram, "uWidth");
+    GLint locH = glGetUniformLocation(g_passthroughProgram, "uHeight");
+    glUniform1i(locW, width);
+    glUniform1i(locH, height);
+
+    // round up workgroups so every pixel is covered
+    GLuint groupsX = (GLuint)(width  + 15) / 16;
+    GLuint groupsY = (GLuint)(height + 15) / 16;
+    glDispatchCompute(groupsX, groupsY, 1);
+
+    // ensure all shader writes are visible before we read back the SSBO
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+    // read back the output SSBO via a mapped pointer
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    void* gpuData = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, totalBytes, GL_MAP_READ_BIT);
+    if (gpuData) {
+        memcpy(dstBytes, gpuData, totalBytes);
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    } else {
+        LOGI("nativeGpuPassThrough: glMapBufferRange returned null — readback failed");
+    }
+
+    // cleanup transient SSBOs
+    glDeleteBuffers(1, &ssboIn);
+    glDeleteBuffers(1, &ssboOut);
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput,   srcBytes, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outputArray, dstBytes, 0);
+
+    return outputArray;
+}
+
+// phase 3 stage 1 — verify the pass-through SSBO pipeline
+// compares the GPU pass-through output against the original input byte-for-byte
+// any mismatch indicates an SSBO upload/readback failure
+// returns "GPU PASS: " on exact match or "GPU FAIL: " with mismatch count
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_csproject_MainActivity_nativeVerifyGpuPassThrough(
+        JNIEnv* env, jobject thiz,
+        jbyteArray rgbaInput, jint width, jint height) {
+
+    // run the pass-through and get GPU output
+    jbyteArray gpuOutput = Java_com_example_csproject_MainActivity_nativeGpuPassThrough(
+            env, thiz, rgbaInput, width, height);
+
+    int totalBytes = width * height * 4;
+
+    jbyte* src = (jbyte*)env->GetPrimitiveArrayCritical(rgbaInput,  nullptr);
+    jbyte* dst = (jbyte*)env->GetPrimitiveArrayCritical(gpuOutput,  nullptr);
+
+    int mismatches = 0;
+    for (int i = 0; i < totalBytes && mismatches <= 10; i++) {
+        if (src[i] != dst[i]) {
+            if (mismatches < 5) {
+                LOGI("GPU pass-through mismatch @byte %d: src=%u dst=%u",
+                     i, (uint8_t)src[i], (uint8_t)dst[i]);
+            }
+            mismatches++;
+        }
+    }
+    // finish counting without logging every mismatch
+    if (mismatches > 10) {
+        for (int i = 50; i < totalBytes; i++)
+            if (src[i] != dst[i]) mismatches++;
+    }
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput,  src, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(gpuOutput,  dst, JNI_ABORT);
+    env->DeleteLocalRef(gpuOutput);
+
+    char msg[128];
+    if (mismatches == 0) {
+        snprintf(msg, sizeof(msg), "GPU PASS: SSBO round-trip exact (%d bytes)", totalBytes);
+        LOGI("GPU pass-through verified — %d bytes match exactly", totalBytes);
+    } else {
+        snprintf(msg, sizeof(msg), "GPU FAIL: %d mismatches in %d bytes", mismatches, totalBytes);
+        LOGI("GPU pass-through FAILED — %d mismatches", mismatches);
     }
     return env->NewStringUTF(msg);
 }
