@@ -498,8 +498,9 @@ static EGLDisplay g_eglDisplay = EGL_NO_DISPLAY;
 static EGLContext g_eglContext = EGL_NO_CONTEXT;
 static EGLSurface g_eglSurface = EGL_NO_SURFACE;  // 1×1 pbuffer (needed to make context current)
 
-// compiled pass-through compute shader program handle
-static GLuint g_passthroughProgram = 0;
+// compiled shader program handles
+static GLuint g_passthroughProgram = 0;  // phase 3 stage 1 — SSBO copy verification
+static GLuint g_sobelProgram       = 0;  // phase 3 stage 2 — GPU Sobel edge detection
 
 // helper: compile a single compute shader from GLSL source and link it into a program
 // returns the program id on success, 0 on any error (details logged to logcat)
@@ -552,6 +553,66 @@ void main() {
     if (x >= uint(uWidth) || y >= uint(uHeight)) return;
     uint idx = y * uint(uWidth) + x;
     outputData[idx] = inputData[idx];  // copy pixel unchanged
+}
+)";
+
+// phase 3 stage 2 — Sobel edge detection compute shader (OpenGL ES 3.1 GLSL)
+// pixel layout: each uint in the SSBO holds one RGBA pixel on a little-endian ARM device
+// the shader applies the same 3×3 Sobel kernels and L1/2 magnitude formula used by
+// nativeSobelFilter and nativeSobelNeon, so all three paths produce identical results
+// and can be compared byte-for-byte in Stage 3 correctness verification.
+static const char* SOBEL_SHADER_SRC = R"(#version 310 es
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer InputBuffer  { uint inputPixels[];  };
+layout(std430, binding = 1) writeonly buffer OutputBuffer { uint outputPixels[]; };
+
+uniform int uWidth;
+uniform int uHeight;
+
+// extract 8-bit channel ch (0=R 1=G 2=B) from a packed RGBA uint
+// ARM little-endian: R at bits 0-7, G at 8-15, B at 16-23, A at 24-31
+uint chan(uint pixel, int ch) {
+    return (pixel >> uint(ch * 8)) & 0xFFu;
+}
+
+// fetch a pixel with clamp-to-edge border handling
+uint fetchPixel(int col, int row) {
+    col = clamp(col, 0, uWidth  - 1);
+    row = clamp(row, 0, uHeight - 1);
+    return inputPixels[row * uWidth + col];
+}
+
+void main() {
+    int col = int(gl_GlobalInvocationID.x);
+    int row = int(gl_GlobalInvocationID.y);
+    if (col >= uWidth || row >= uHeight) return;
+
+    // load the 8 neighbors used by the 3x3 Sobel window (center pixel has weight 0)
+    uint tL = fetchPixel(col-1, row-1);  uint tC = fetchPixel(col, row-1);  uint tR = fetchPixel(col+1, row-1);
+    uint mL = fetchPixel(col-1, row);                                        uint mR = fetchPixel(col+1, row);
+    uint bL = fetchPixel(col-1, row+1);  uint bC = fetchPixel(col, row+1);  uint bR = fetchPixel(col+1, row+1);
+
+    // apply Sobel to R, G, B independently; store results in outChannels[0..2]
+    uint outChannels[3];
+    for (int ch = 0; ch < 3; ch++) {
+        int tLv = int(chan(tL,ch));  int tCv = int(chan(tC,ch));  int tRv = int(chan(tR,ch));
+        int mLv = int(chan(mL,ch));                               int mRv = int(chan(mR,ch));
+        int bLv = int(chan(bL,ch));  int bCv = int(chan(bC,ch));  int bRv = int(chan(bR,ch));
+
+        // Gx kernel: [-1  0 +1 / -2  0 +2 / -1  0 +1]  →  right column minus left column
+        int absGx = abs((tRv + 2*mRv + bRv) - (tLv + 2*mLv + bLv));
+
+        // Gy kernel: [-1 -2 -1 /  0  0  0 / +1 +2 +1]  →  bottom row minus top row
+        int absGy = abs((bLv + 2*bCv + bRv) - (tLv + 2*tCv + tRv));
+
+        // L1/2 magnitude — identical formula to nativeSobelFilter and nativeSobelNeon
+        outChannels[ch] = uint(clamp((absGx + absGy) >> 1, 0, 255));
+    }
+
+    // pack R, G, B, A=255 back into one uint and write to output SSBO
+    outputPixels[row * uWidth + col] =
+        (255u << 24u) | (outChannels[2] << 16u) | (outChannels[1] << 8u) | outChannels[0];
 }
 )";
 
@@ -626,15 +687,21 @@ Java_com_example_csproject_MainActivity_nativeInitGpu(JNIEnv* env, jobject) {
         return env->NewStringUTF("GPU FAIL: eglMakeCurrent failed");
     }
 
-    // step 8 — compile and link the pass-through compute shader
+    // step 8 — compile pass-through compute shader (stage 1 verification)
     g_passthroughProgram = compileComputeProgram(PASSTHROUGH_SHADER_SRC);
     if (g_passthroughProgram == 0) {
         return env->NewStringUTF("GPU FAIL: pass-through compute shader failed to compile");
     }
 
-    LOGI("GPU init success — EGL %d.%d, pass-through compute shader ready", major, minor);
+    // step 9 — compile Sobel compute shader (stage 2 edge detection)
+    g_sobelProgram = compileComputeProgram(SOBEL_SHADER_SRC);
+    if (g_sobelProgram == 0) {
+        return env->NewStringUTF("GPU FAIL: Sobel compute shader failed to compile");
+    }
+
+    LOGI("GPU init success — EGL %d.%d, pass-through + Sobel shaders compiled", major, minor);
     char msg[128];
-    snprintf(msg, sizeof(msg), "GPU OK — EGL %d.%d, compute shader compiled", major, minor);
+    snprintf(msg, sizeof(msg), "GPU OK — EGL %d.%d, shaders compiled", major, minor);
     return env->NewStringUTF(msg);
 }
 
@@ -756,4 +823,75 @@ Java_com_example_csproject_MainActivity_nativeVerifyGpuPassThrough(
         LOGI("GPU pass-through FAILED — %d mismatches", mismatches);
     }
     return env->NewStringUTF(msg);
+}
+
+// ============================================================
+// phase 3 stage 2 — GPU Sobel filter via compute shader
+// ============================================================
+
+// runs the Sobel edge detection compute shader on the input rgba buffer.
+// each of the width*height invocations handles one pixel — reads its 3×3
+// neighborhood from the input SSBO, applies Sobel Gx/Gy kernels, writes
+// the L1/2 magnitude to the output SSBO, then the result is read back to the CPU.
+// returns empty array if GPU was not initialized (nativeInitGpu not yet called).
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_csproject_MainActivity_nativeGpuSobel(
+        JNIEnv* env, jobject,
+        jbyteArray rgbaInput, jint width, jint height) {
+
+    int totalBytes = width * height * 4;
+    jbyteArray outputArray = env->NewByteArray(totalBytes);
+
+    if (g_sobelProgram == 0 || g_eglContext == EGL_NO_CONTEXT) {
+        LOGI("nativeGpuSobel: GPU not initialized — returning empty buffer");
+        return outputArray;
+    }
+
+    jbyte* srcBytes = (jbyte*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
+    jbyte* dstBytes = (jbyte*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
+
+    // --- upload input pixels to SSBO at binding 0 ---
+    GLuint ssboIn = 0, ssboOut = 0;
+    glGenBuffers(1, &ssboIn);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboIn);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, srcBytes, GL_STATIC_READ);
+
+    // --- create empty output SSBO at binding 1 ---
+    glGenBuffers(1, &ssboOut);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_STATIC_COPY);
+
+    // --- bind program and SSBOs, set image dimensions ---
+    glUseProgram(g_sobelProgram);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboIn);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboOut);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uWidth"),  width);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uHeight"), height);
+
+    // --- dispatch: one thread per pixel, workgroups of 16×16 ---
+    // for 1280×720: groupsX=80, groupsY=45 → 3600 workgroups × 256 threads = 921600 threads
+    GLuint groupsX = (GLuint)(width  + 15) / 16;
+    GLuint groupsY = (GLuint)(height + 15) / 16;
+    glDispatchCompute(groupsX, groupsY, 1);
+
+    // wait for all shader writes to be visible before reading the output SSBO
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    // --- read back the edge-detected pixels ---
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    void* gpuData = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, totalBytes, GL_MAP_READ_BIT);
+    if (gpuData) {
+        memcpy(dstBytes, gpuData, totalBytes);
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    } else {
+        LOGI("nativeGpuSobel: glMapBufferRange returned null — readback failed");
+    }
+
+    glDeleteBuffers(1, &ssboIn);
+    glDeleteBuffers(1, &ssboOut);
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput,   srcBytes, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outputArray, dstBytes, 0);
+
+    return outputArray;
 }
