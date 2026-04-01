@@ -9,6 +9,9 @@ add_library(csproject SHARED native-lib.cpp)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 
+# align ELF LOAD segments to 16 KB for Android 15+ device compatibility
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+
 # locate android's built-in libraries
 find_library(log-lib log)
 find_library(EGL-lib EGL)      # phase 3 stage 1 — EGL context management

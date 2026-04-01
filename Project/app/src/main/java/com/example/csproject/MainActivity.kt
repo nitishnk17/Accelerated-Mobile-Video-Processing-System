@@ -101,6 +101,11 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
+    // phase 3 stage 3: checks if the gpu sobel output actually matches the scalar baseline
+    external fun nativeVerifyGpuSobel(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): String
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -164,6 +169,8 @@ fun CameraScreen() {
 
     // phase 3 stage 1 — GPU init + pass-through SSBO verification result
     var gpuInitResult by remember { mutableStateOf<String?>(null) }
+    // phase 3 stage 3: did the gpu sobel pass or fail the correctness check
+    var gpuSobelCheckResult by remember { mutableStateOf<String?>(null) }
     val gpuInitDone   = remember { booleanArrayOf(false) }  // run only once, on first frame
 
 
@@ -260,6 +267,13 @@ fun CameraScreen() {
                         initMsg  // propagate the init failure as the verify result
                     Log.d(TAG, "gpu verify: $verifyMsg")
                     mainHandler.post { gpuInitResult = verifyMsg }
+
+                    // only bother checking sobel correctness if the ssbo pipeline itself works
+                    if (verifyMsg.startsWith("GPU PASS")) {
+                        val sobelVerify = activity.nativeVerifyGpuSobel(rgbaBytes, image.width, image.height)
+                        Log.d(TAG, "gpu sobel verify: $sobelVerify")
+                        mainHandler.post { gpuSobelCheckResult = sobelVerify }
+                    }
                 }
 
                 // route frame to active mode: 0=Baseline  1=SIMD  2=GPU
@@ -416,6 +430,16 @@ fun CameraScreen() {
                 val ok = it.startsWith("GPU PASS")
                 Text(
                     if (ok) "GPU:  PASS " else "GPU:  FAIL ",
+                    color = if (ok) Color.Green else Color.Red,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
+
+            // gpu sobel correctness badge: only shows up once the check has run
+            gpuSobelCheckResult?.let {
+                val ok = it.startsWith("GPU SOBEL PASS")
+                Text(
+                    if (ok) "GPU Sobel: PASS " else "GPU Sobel: FAIL ",
                     color = if (ok) Color.Green else Color.Red,
                     fontSize = 13.sp, fontWeight = FontWeight.Bold
                 )
