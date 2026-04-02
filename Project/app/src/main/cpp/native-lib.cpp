@@ -3,6 +3,7 @@
 #include <jni.h>
 #include <string>
 #include <cstring>
+#include <thread>
 #include <arm_neon.h>
 #include <android/log.h>
 
@@ -569,6 +570,7 @@ layout(std430, binding = 1) writeonly buffer OutputBuffer { uint outputPixels[];
 
 uniform int uWidth;
 uniform int uHeight;
+uniform int uRowOffset;
 
 // extract 8-bit channel ch (0=R 1=G 2=B) from a packed RGBA uint
 // ARM little-endian: R at bits 0-7, G at 8-15, B at 16-23, A at 24-31
@@ -585,7 +587,7 @@ uint fetchPixel(int col, int row) {
 
 void main() {
     int col = int(gl_GlobalInvocationID.x);
-    int row = int(gl_GlobalInvocationID.y);
+    int row = int(gl_GlobalInvocationID.y) + uRowOffset;
     if (col >= uWidth || row >= uHeight) return;
 
     // load the 8 neighbors used by the 3x3 Sobel window (center pixel has weight 0)
@@ -610,8 +612,8 @@ void main() {
         outChannels[ch] = uint(clamp((absGx + absGy) >> 1, 0, 255));
     }
 
-    // pack R, G, B, A=255 back into one uint and write to output SSBO
-    outputPixels[row * uWidth + col] =
+    // write to output SSBO; (row - uRowOffset) maps back to index 0 for hybrid's partial buffer
+    outputPixels[(row - uRowOffset) * uWidth + col] =
         (255u << 24u) | (outChannels[2] << 16u) | (outChannels[1] << 8u) | outChannels[0];
 }
 )";
@@ -874,8 +876,9 @@ Java_com_example_csproject_MainActivity_nativeGpuSobel(
     glUseProgram(g_sobelProgram);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboIn);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboOut);
-    glUniform1i(glGetUniformLocation(g_sobelProgram, "uWidth"),  width);
-    glUniform1i(glGetUniformLocation(g_sobelProgram, "uHeight"), height);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uWidth"),     width);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uHeight"),    height);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uRowOffset"), 0);
 
     // dispatch: one thread per pixel, 8x8 workgroups for mali compat
     // for 1280x720: groupsX=160, groupsY=90 -> 14400 workgroups x 64 threads = 921600 threads
@@ -956,4 +959,205 @@ Java_com_example_csproject_MainActivity_nativeVerifyGpuSobel(
         LOGI("GPU Sobel verification failed: %d mismatches, worst diff=%d", mismatches, worst);
     }
     return env->NewStringUTF(msg);
+}
+
+// ============================================================
+// phase 3 stage 4 — Hybrid mode helpers
+// ============================================================
+
+// neon sobel over [startRow, endRow) only; reads full buffer for 3x3 border access
+static void sobelNeonRows(const uint8_t* inputBuf, uint8_t* outputBuf,
+                           int width, int height, int startRow, int endRow) {
+
+    for (int row = startRow; row < endRow; row++) {
+
+        uint8_t* dstRow = outputBuf + row * width * 4;
+
+        int prevRowIdx = (row > 0)          ? row - 1 : 0;
+        int nextRowIdx = (row < height - 1) ? row + 1 : height - 1;
+        const uint8_t* topRowPtr = inputBuf + prevRowIdx * width * 4;
+        const uint8_t* midRowPtr = inputBuf + row        * width * 4;
+        const uint8_t* botRowPtr = inputBuf + nextRowIdx * width * 4;
+
+        int col = 1;
+        for (; col + 16 <= width - 1; col += 16) {
+
+            uint8x16x4_t topLeft    = vld4q_u8(topRowPtr + (col - 1) * 4);
+            uint8x16x4_t topCenter  = vld4q_u8(topRowPtr +  col      * 4);
+            uint8x16x4_t topRight   = vld4q_u8(topRowPtr + (col + 1) * 4);
+            uint8x16x4_t midLeft    = vld4q_u8(midRowPtr + (col - 1) * 4);
+            uint8x16x4_t midRight   = vld4q_u8(midRowPtr + (col + 1) * 4);
+            uint8x16x4_t botLeft    = vld4q_u8(botRowPtr + (col - 1) * 4);
+            uint8x16x4_t botCenter  = vld4q_u8(botRowPtr +  col      * 4);
+            uint8x16x4_t botRight   = vld4q_u8(botRowPtr + (col + 1) * 4);
+
+            uint8x16x4_t pixelResult;
+            pixelResult.val[3] = vdupq_n_u8(255);
+
+            for (int ch = 0; ch < 3; ch++) {
+                uint8x16_t tL = topLeft.val[ch];
+                uint8x16_t tC = topCenter.val[ch];
+                uint8x16_t tR = topRight.val[ch];
+                uint8x16_t mL = midLeft.val[ch];
+                uint8x16_t mR = midRight.val[ch];
+                uint8x16_t bL = botLeft.val[ch];
+                uint8x16_t bC = botCenter.val[ch];
+                uint8x16_t bR = botRight.val[ch];
+
+                uint16x8_t gxPosLow  = vaddl_u8(vget_low_u8(tR),  vget_low_u8(bR));
+                uint16x8_t gxPosHigh = vaddl_u8(vget_high_u8(tR), vget_high_u8(bR));
+                gxPosLow  = vmlal_u8(gxPosLow,  vget_low_u8(mR),  vdup_n_u8(2));
+                gxPosHigh = vmlal_u8(gxPosHigh, vget_high_u8(mR), vdup_n_u8(2));
+
+                uint16x8_t gxNegLow  = vaddl_u8(vget_low_u8(tL),  vget_low_u8(bL));
+                uint16x8_t gxNegHigh = vaddl_u8(vget_high_u8(tL), vget_high_u8(bL));
+                gxNegLow  = vmlal_u8(gxNegLow,  vget_low_u8(mL),  vdup_n_u8(2));
+                gxNegHigh = vmlal_u8(gxNegHigh, vget_high_u8(mL), vdup_n_u8(2));
+
+                uint16x8_t absGxLow  = vabdq_u16(gxPosLow,  gxNegLow);
+                uint16x8_t absGxHigh = vabdq_u16(gxPosHigh, gxNegHigh);
+
+                uint16x8_t gyPosLow  = vaddl_u8(vget_low_u8(bL),  vget_low_u8(bR));
+                uint16x8_t gyPosHigh = vaddl_u8(vget_high_u8(bL), vget_high_u8(bR));
+                gyPosLow  = vmlal_u8(gyPosLow,  vget_low_u8(bC),  vdup_n_u8(2));
+                gyPosHigh = vmlal_u8(gyPosHigh, vget_high_u8(bC), vdup_n_u8(2));
+
+                uint16x8_t gyNegLow  = vaddl_u8(vget_low_u8(tL),  vget_low_u8(tR));
+                uint16x8_t gyNegHigh = vaddl_u8(vget_high_u8(tL), vget_high_u8(tR));
+                gyNegLow  = vmlal_u8(gyNegLow,  vget_low_u8(tC),  vdup_n_u8(2));
+                gyNegHigh = vmlal_u8(gyNegHigh, vget_high_u8(tC), vdup_n_u8(2));
+
+                uint16x8_t absGyLow  = vabdq_u16(gyPosLow,  gyNegLow);
+                uint16x8_t absGyHigh = vabdq_u16(gyPosHigh, gyNegHigh);
+
+                uint16x8_t magnitudeLow  = vaddq_u16(absGxLow,  absGyLow);
+                uint16x8_t magnitudeHigh = vaddq_u16(absGxHigh, absGyHigh);
+
+                uint8x8_t magLowByte  = vqshrn_n_u16(magnitudeLow,  1);
+                uint8x8_t magHighByte = vqshrn_n_u16(magnitudeHigh, 1);
+                pixelResult.val[ch]   = vcombine_u8(magLowByte, magHighByte);
+            }
+
+            vst4q_u8(dstRow + col * 4, pixelResult);
+        }
+
+        auto scalarSobelAtCol = [&](int c) {
+            int gxR = 0, gyR = 0, gxG = 0, gyG = 0, gxB = 0, gyB = 0;
+
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int neighborRow = clampIdx(row + ky, height);
+                    int neighborCol = clampIdx(c   + kx, width);
+                    int pixelIdx    = (neighborRow * width + neighborCol) * 4;
+
+                    int r = inputBuf[pixelIdx];
+                    int g = inputBuf[pixelIdx + 1];
+                    int b = inputBuf[pixelIdx + 2];
+
+                    int gxWeight = (kx == -1) ? -(ky == 0 ? 2 : 1)
+                                 : (kx ==  1) ?  (ky == 0 ? 2 : 1) : 0;
+                    int gyWeight = (ky == -1) ? -(kx == 0 ? 2 : 1)
+                                 : (ky ==  1) ?  (kx == 0 ? 2 : 1) : 0;
+
+                    gxR += r * gxWeight;  gyR += r * gyWeight;
+                    gxG += g * gxWeight;  gyG += g * gyWeight;
+                    gxB += b * gxWeight;  gyB += b * gyWeight;
+                }
+            }
+
+            int absGxR = gxR < 0 ? -gxR : gxR,  absGyR = gyR < 0 ? -gyR : gyR;
+            int absGxG = gxG < 0 ? -gxG : gxG,  absGyG = gyG < 0 ? -gyG : gyG;
+            int absGxB = gxB < 0 ? -gxB : gxB,  absGyB = gyB < 0 ? -gyB : gyB;
+            int magR = (absGxR + absGyR) >> 1;
+            int magG = (absGxG + absGyG) >> 1;
+            int magB = (absGxB + absGyB) >> 1;
+
+            int outOffset = c * 4;
+            dstRow[outOffset]     = (uint8_t)(magR > 255 ? 255 : magR);
+            dstRow[outOffset + 1] = (uint8_t)(magG > 255 ? 255 : magG);
+            dstRow[outOffset + 2] = (uint8_t)(magB > 255 ? 255 : magB);
+            dstRow[outOffset + 3] = 255;
+        };
+
+        scalarSobelAtCol(0);
+        for (int c = col; c < width; c++)
+            scalarSobelAtCol(c);
+    }
+}
+
+// phase 3 stage 4 — hybrid sobel: splits frame at height/2, runs NEON on a
+// spawned thread (top half) and GPU on the current EGL thread (bottom half)
+// concurrently, then joins and returns the stitched result
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_csproject_MainActivity_nativeHybridSobel(
+        JNIEnv* env, jobject,
+        jbyteArray rgbaInput, jint width, jint height) {
+
+    int totalBytes = width * height * 4;
+    jbyteArray outputArray = env->NewByteArray(totalBytes);
+
+    if (g_sobelProgram == 0 || g_eglContext == EGL_NO_CONTEXT) {
+        static bool warned = false;
+        if (!warned) { LOGI("nativeHybridSobel: GPU not initialized, falling back to full NEON"); warned = true; }
+        uint8_t* src = (uint8_t*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
+        uint8_t* dst = (uint8_t*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
+        sobelNeonRows(src, dst, width, height, 0, height);
+        env->ReleasePrimitiveArrayCritical(rgbaInput,   src, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(outputArray, dst, 0);
+        return outputArray;
+    }
+
+    uint8_t* inputBuf  = (uint8_t*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
+    uint8_t* outputBuf = (uint8_t*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
+
+    int midRow = height / 2;
+
+    // neon top half on a separate thread
+    std::thread neonThread(sobelNeonRows, inputBuf, outputBuf, width, height, 0, midRow);
+
+    // gpu bottom half on this thread (owns the EGL context)
+    int bottomRows  = height - midRow;
+    int bottomBytes = bottomRows * width * 4;
+
+    GLuint ssboIn = 0, ssboOut = 0;
+
+    // full input needed so the shader can read neighbor rows across the split
+    glGenBuffers(1, &ssboIn);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboIn);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, inputBuf, GL_STATIC_READ);
+
+    glGenBuffers(1, &ssboOut);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bottomBytes, nullptr, GL_STATIC_COPY);
+
+    glUseProgram(g_sobelProgram);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboIn);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboOut);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uWidth"),     width);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uHeight"),    height);
+    glUniform1i(glGetUniformLocation(g_sobelProgram, "uRowOffset"), midRow);
+
+    GLuint groupsX = (GLuint)(width      + 7) / 8;
+    GLuint groupsY = (GLuint)(bottomRows + 7) / 8;
+    glDispatchCompute(groupsX, groupsY, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    void* gpuData = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, bottomBytes, GL_MAP_READ_BIT);
+    if (gpuData) {
+        memcpy(outputBuf + midRow * width * 4, gpuData, bottomBytes);
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    } else {
+        LOGI("nativeHybridSobel: GPU readback failed, bottom half will be black");
+    }
+
+    glDeleteBuffers(1, &ssboIn);
+    glDeleteBuffers(1, &ssboOut);
+
+    neonThread.join();
+
+    env->ReleasePrimitiveArrayCritical(rgbaInput,   inputBuf,  JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outputArray, outputBuf, 0);
+
+    return outputArray;
 }

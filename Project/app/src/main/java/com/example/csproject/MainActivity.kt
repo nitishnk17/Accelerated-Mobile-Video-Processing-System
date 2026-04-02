@@ -60,6 +60,7 @@ class MainActivity : ComponentActivity() {
         yBytes: ByteArray, uBytes: ByteArray, vBytes: ByteArray,
         width: Int, height: Int,
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int
+        
     ): ByteArray
 
     // runs 3x3 sobel edge detection on an rgba buffer
@@ -105,6 +106,11 @@ class MainActivity : ComponentActivity() {
     external fun nativeVerifyGpuSobel(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
+
+    // phase 3 stage 4: hybrid sobel — NEON top half + GPU bottom half concurrently
+    external fun nativeHybridSobel(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
 
     companion object {
         init {
@@ -158,7 +164,7 @@ fun CameraScreen() {
 
     // hold the latest rotated rgba bitmap for display
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    // 0=Baseline  1=SIMD  2=GPU — cycles on button tap
+    // 0=Baseline  1=SIMD  2=GPU  3=Hybrid — cycles on button tap
     var mode            by remember { mutableStateOf(0) }
     var simdCheckResult by remember { mutableStateOf<String?>(null) }
 
@@ -166,6 +172,7 @@ fun CameraScreen() {
     var baselineSobelMs by remember { mutableStateOf(0L) }
     var neonSobelMs     by remember { mutableStateOf(0L) }
     var gpuSobelMs      by remember { mutableStateOf(0L) }
+    var hybridSobelMs   by remember { mutableStateOf(0L) }
 
     // phase 3 stage 1 — GPU init + pass-through SSBO verification result
     var gpuInitResult by remember { mutableStateOf<String?>(null) }
@@ -276,11 +283,12 @@ fun CameraScreen() {
                     }
                 }
 
-                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU
+                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU  3=Hybrid
                 val sobelStart = System.currentTimeMillis()
                 val edgeBytes = when (mode) {
                     1    -> activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
                     2    -> activity.nativeGpuSobel(rgbaBytes, image.width, image.height)
+                    3    -> activity.nativeHybridSobel(rgbaBytes, image.width, image.height)
                     else -> activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
                 }
                 val sobelLat = System.currentTimeMillis() - sobelStart
@@ -308,6 +316,7 @@ fun CameraScreen() {
                     when (mode) {
                         1    -> neonSobelMs     = sobelLat
                         2    -> gpuSobelMs      = sobelLat
+                        3    -> hybridSobelMs   = sobelLat
                         else -> baselineSobelMs = sobelLat
                     }
                 }
@@ -358,9 +367,9 @@ fun CameraScreen() {
             )
         }
 
-        // cycle: Baseline → SIMD → GPU → Baseline
+        // cycle: Baseline → SIMD → GPU → Hybrid → Baseline
         Button(
-            onClick = { mode = (mode + 1) % 3 },
+            onClick = { mode = (mode + 1) % 4 },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 24.dp)
@@ -368,6 +377,7 @@ fun CameraScreen() {
             Text(when (mode) {
                 0    -> "Switch to SIMD"
                 1    -> "Switch to GPU"
+                2    -> "Switch to Hybrid"
                 else -> "Switch to Baseline"
             })
         }
@@ -383,8 +393,8 @@ fun CameraScreen() {
         ) {
             // mode header
             Text(
-                text = when (mode) { 0 -> "MODE: Baseline"; 1 -> "MODE: SIMD"; else -> "MODE: GPU" },
-                color = when (mode) { 0 -> Color.Cyan; 1 -> Color.Green; else -> Color(0xFFFF9800) },
+                text = when (mode) { 0 -> "MODE: Baseline"; 1 -> "MODE: SIMD"; 2 -> "MODE: GPU"; else -> "MODE: Hybrid" },
+                color = when (mode) { 0 -> Color.Cyan; 1 -> Color.Green; 2 -> Color(0xFFFF9800); else -> Color.Magenta },
                 fontSize = 13.sp, fontWeight = FontWeight.Bold
             )
 
@@ -446,17 +456,20 @@ fun CameraScreen() {
             }
 
             // speedup table — shown once at least two modes have been sampled
-            if (baselineSobelMs > 0 && (neonSobelMs > 0 || gpuSobelMs > 0)) {
+            if (baselineSobelMs > 0 && (neonSobelMs > 0 || gpuSobelMs > 0 || hybridSobelMs > 0)) {
                 Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-                Text("Base:  ${baselineSobelMs} ms", color = Color.Cyan,            fontSize = 13.sp)
+                Text("Base:   ${baselineSobelMs} ms", color = Color.Cyan,            fontSize = 13.sp)
                 if (neonSobelMs > 0)
-                    Text("NEON:  ${neonSobelMs} ms", color = Color.Green,            fontSize = 13.sp)
+                    Text("NEON:   ${neonSobelMs} ms", color = Color.Green,            fontSize = 13.sp)
                 if (gpuSobelMs  > 0)
-                    Text("GPU:   ${gpuSobelMs} ms",  color = Color(0xFFFF9800),      fontSize = 13.sp)
+                    Text("GPU:    ${gpuSobelMs} ms",  color = Color(0xFFFF9800),      fontSize = 13.sp)
+                if (hybridSobelMs > 0)
+                    Text("Hybrid: ${hybridSobelMs} ms", color = Color.Magenta,        fontSize = 13.sp)
                 // show speedup vs baseline for whichever accelerated modes have run
                 val bestMs = listOfNotNull(
-                    if (neonSobelMs > 0) neonSobelMs else null,
-                    if (gpuSobelMs  > 0) gpuSobelMs  else null
+                    if (neonSobelMs    > 0) neonSobelMs    else null,
+                    if (gpuSobelMs     > 0) gpuSobelMs     else null,
+                    if (hybridSobelMs  > 0) hybridSobelMs  else null
                 ).min()
                 val ratio = baselineSobelMs.toDouble() / bestMs.toDouble()
                 Text(
