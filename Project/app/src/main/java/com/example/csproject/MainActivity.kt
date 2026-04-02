@@ -82,6 +82,30 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
 
+    // phase 3 stage 1 — spins up a headless EGL context and compiles the pass-through compute shader
+    // must be called on the thread that will subsequently make OpenGL ES calls
+    external fun nativeInitGpu(): String
+
+    // phase 3 stage 1 — copies rgbaBytes through a GPU SSBO pass-through compute shader
+    external fun nativeGpuPassThrough(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
+
+    // phase 3 stage 1 — verifies that the SSBO round-trip produces an exact copy, returns "GPU PASS/FAIL: ..."
+    external fun nativeVerifyGpuPassThrough(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): String
+
+    // phase 3 stage 2 — runs Sobel edge detection on the GPU via compute shader + SSBOs
+    external fun nativeGpuSobel(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
+
+    // phase 3 stage 3: checks if the gpu sobel output actually matches the scalar baseline
+    external fun nativeVerifyGpuSobel(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): String
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -134,12 +158,20 @@ fun CameraScreen() {
 
     // hold the latest rotated rgba bitmap for display
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var useSimd         by remember { mutableStateOf(false) }  // phase 2 stage 4 — false=Baseline, true=SIMD
+    // 0=Baseline  1=SIMD  2=GPU — cycles on button tap
+    var mode            by remember { mutableStateOf(0) }
     var simdCheckResult by remember { mutableStateOf<String?>(null) }
 
-    // phase 2 stage 5 — track sobel latency per mode to compute speedup ratio
+    // track sobel latency per mode for speedup comparison
     var baselineSobelMs by remember { mutableStateOf(0L) }
     var neonSobelMs     by remember { mutableStateOf(0L) }
+    var gpuSobelMs      by remember { mutableStateOf(0L) }
+
+    // phase 3 stage 1 — GPU init + pass-through SSBO verification result
+    var gpuInitResult by remember { mutableStateOf<String?>(null) }
+    // phase 3 stage 3: did the gpu sobel pass or fail the correctness check
+    var gpuSobelCheckResult by remember { mutableStateOf<String?>(null) }
+    val gpuInitDone   = remember { booleanArrayOf(false) }  // run only once, on first frame
 
 
     // need a reference to the activity to call the jni method
@@ -222,12 +254,35 @@ fun CameraScreen() {
                     mainHandler.post { simdCheckResult = result }
                 }
 
-                // phase 2 stage 4 — route to neon or scalar based on toggle
+                // phase 3 stage 1 — initialize the headless EGL context on this background thread
+                // then immediately verify SSBO round-trip correctness with the pass-through shader
+                // must happen here (not in onCreate) so the EGL context is bound to this thread
+                if (!gpuInitDone[0]) {
+                    gpuInitDone[0] = true
+                    val initMsg = activity.nativeInitGpu()
+                    Log.d(TAG, "gpu init: $initMsg")
+                    val verifyMsg = if (initMsg.startsWith("GPU OK"))
+                        activity.nativeVerifyGpuPassThrough(rgbaBytes, image.width, image.height)
+                    else
+                        initMsg  // propagate the init failure as the verify result
+                    Log.d(TAG, "gpu verify: $verifyMsg")
+                    mainHandler.post { gpuInitResult = verifyMsg }
+
+                    // only bother checking sobel correctness if the ssbo pipeline itself works
+                    if (verifyMsg.startsWith("GPU PASS")) {
+                        val sobelVerify = activity.nativeVerifyGpuSobel(rgbaBytes, image.width, image.height)
+                        Log.d(TAG, "gpu sobel verify: $sobelVerify")
+                        mainHandler.post { gpuSobelCheckResult = sobelVerify }
+                    }
+                }
+
+                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU
                 val sobelStart = System.currentTimeMillis()
-                val edgeBytes = if (useSimd)
-                    activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
-                else
-                    activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
+                val edgeBytes = when (mode) {
+                    1    -> activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
+                    2    -> activity.nativeGpuSobel(rgbaBytes, image.width, image.height)
+                    else -> activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
+                }
                 val sobelLat = System.currentTimeMillis() - sobelStart
 
                 // build bitmap from rgba bytes and rotate 90° to match display orientation
@@ -249,8 +304,12 @@ fun CameraScreen() {
                     endToEndLatencyMs   = e2eLatency
                     frameIntervalMs     = intervalMs
                     processedBitmap     = bmp
-                    // phase 2 stage 5 — store latency per mode for speedup ratio
-                    if (useSimd) neonSobelMs = sobelLat else baselineSobelMs = sobelLat
+                    // store latency per mode for speedup comparison
+                    when (mode) {
+                        1    -> neonSobelMs     = sobelLat
+                        2    -> gpuSobelMs      = sobelLat
+                        else -> baselineSobelMs = sobelLat
+                    }
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -299,14 +358,18 @@ fun CameraScreen() {
             )
         }
 
-        // phase 2 stage 4 — toggle between scalar baseline and neon simd
+        // cycle: Baseline → SIMD → GPU → Baseline
         Button(
-            onClick = { useSimd = !useSimd },
+            onClick = { mode = (mode + 1) % 3 },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 24.dp)
         ) {
-            Text(if (useSimd) "Switch to Baseline" else "Switch to SIMD")
+            Text(when (mode) {
+                0    -> "Switch to SIMD"
+                1    -> "Switch to GPU"
+                else -> "Switch to Baseline"
+            })
         }
 
         // semi-transparent hud pinned to top-left corner
@@ -320,8 +383,8 @@ fun CameraScreen() {
         ) {
             // mode header
             Text(
-                text = if (useSimd) "MODE: SIMD" else "MODE: Baseline",
-                color = if (useSimd) Color.Green else Color.Cyan,
+                text = when (mode) { 0 -> "MODE: Baseline"; 1 -> "MODE: SIMD"; else -> "MODE: GPU" },
+                color = when (mode) { 0 -> Color.Cyan; 1 -> Color.Green; else -> Color(0xFFFF9800) },
                 fontSize = 13.sp, fontWeight = FontWeight.Bold
             )
 
@@ -362,12 +425,40 @@ fun CameraScreen() {
                 )
             }
 
-            // phase 2 stage 5 — speedup ratio (shown once both modes have been sampled)
-            if (baselineSobelMs > 0 && neonSobelMs > 0) {
+            // phase 3 stage 1 — gpu context + ssbo pass-through verification badge
+            gpuInitResult?.let {
+                val ok = it.startsWith("GPU PASS")
+                Text(
+                    if (ok) "GPU:  PASS " else "GPU:  FAIL ",
+                    color = if (ok) Color.Green else Color.Red,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
+
+            // gpu sobel correctness badge: only shows up once the check has run
+            gpuSobelCheckResult?.let {
+                val ok = it.startsWith("GPU SOBEL PASS")
+                Text(
+                    if (ok) "GPU Sobel: PASS " else "GPU Sobel: FAIL ",
+                    color = if (ok) Color.Green else Color.Red,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold
+                )
+            }
+
+            // speedup table — shown once at least two modes have been sampled
+            if (baselineSobelMs > 0 && (neonSobelMs > 0 || gpuSobelMs > 0)) {
                 Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-                Text("Base:  ${baselineSobelMs} ms", color = Color.Cyan,  fontSize = 13.sp)
-                Text("NEON:  ${neonSobelMs} ms",     color = Color.Green, fontSize = 13.sp)
-                val ratio = baselineSobelMs.toDouble() / neonSobelMs.toDouble()
+                Text("Base:  ${baselineSobelMs} ms", color = Color.Cyan,            fontSize = 13.sp)
+                if (neonSobelMs > 0)
+                    Text("NEON:  ${neonSobelMs} ms", color = Color.Green,            fontSize = 13.sp)
+                if (gpuSobelMs  > 0)
+                    Text("GPU:   ${gpuSobelMs} ms",  color = Color(0xFFFF9800),      fontSize = 13.sp)
+                // show speedup vs baseline for whichever accelerated modes have run
+                val bestMs = listOfNotNull(
+                    if (neonSobelMs > 0) neonSobelMs else null,
+                    if (gpuSobelMs  > 0) gpuSobelMs  else null
+                ).min()
+                val ratio = baselineSobelMs.toDouble() / bestMs.toDouble()
                 Text(
                     text = "Speedup: ${String.format("%.1f", ratio)}×",
                     color = Color.Yellow,
