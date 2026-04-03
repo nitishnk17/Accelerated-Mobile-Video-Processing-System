@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
         yBytes: ByteArray, uBytes: ByteArray, vBytes: ByteArray,
         width: Int, height: Int,
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int
-        
+
     ): ByteArray
 
     // runs 3x3 sobel edge detection on an rgba buffer
@@ -174,6 +174,11 @@ fun CameraScreen() {
     var gpuSobelMs      by remember { mutableStateOf(0L) }
     var hybridSobelMs   by remember { mutableStateOf(0L) }
 
+    // phase 3 stage 5 — tracks mode switches and any frame drops that happen mid-transition
+    var transitionCount         by remember { mutableStateOf(0) }
+    var droppedDuringTransition by remember { mutableStateOf(0) }
+    val lastModeRef = remember { intArrayOf(0) }  // mutable from the callback, same trick as lastHwTimestampNs
+
     // phase 3 stage 1 — GPU init + pass-through SSBO verification result
     var gpuInitResult by remember { mutableStateOf<String?>(null) }
     // phase 3 stage 3: did the gpu sobel pass or fail the correctness check
@@ -283,9 +288,24 @@ fun CameraScreen() {
                     }
                 }
 
+                // grab mode once so a button tap mid-frame can't mix two paths
+                var currentMode = mode
+                // gpu/hybrid before egl init would return an empty buffer → black flash
+                if ((currentMode == 2 || currentMode == 3) && !gpuInitDone[0]) {
+                    Log.w(TAG, "GPU not ready, falling back to Baseline for this frame")
+                    currentMode = 0
+                }
+
+                val oldMode = lastModeRef[0]
+                val modeChanged = currentMode != oldMode
+                lastModeRef[0] = currentMode
+                if (modeChanged) {
+                    Log.d(TAG, "mode switch: $oldMode → $currentMode")
+                }
+
                 // route frame to active mode: 0=Baseline  1=SIMD  2=GPU  3=Hybrid
                 val sobelStart = System.currentTimeMillis()
-                val edgeBytes = when (mode) {
+                val edgeBytes = when (currentMode) {
                     1    -> activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
                     2    -> activity.nativeGpuSobel(rgbaBytes, image.width, image.height)
                     3    -> activity.nativeHybridSobel(rgbaBytes, image.width, image.height)
@@ -303,6 +323,8 @@ fun CameraScreen() {
                 val procLatency = System.currentTimeMillis() - processingStart
                 val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
 
+                val droppedOnSwitch = modeChanged && intervalMs > 40L
+
                 mainHandler.post {
                     currentFps          = fps
                     processingLatencyMs = procLatency
@@ -313,12 +335,14 @@ fun CameraScreen() {
                     frameIntervalMs     = intervalMs
                     processedBitmap     = bmp
                     // store latency per mode for speedup comparison
-                    when (mode) {
+                    when (currentMode) {
                         1    -> neonSobelMs     = sobelLat
                         2    -> gpuSobelMs      = sobelLat
                         3    -> hybridSobelMs   = sobelLat
                         else -> baselineSobelMs = sobelLat
                     }
+                    if (modeChanged) transitionCount++
+                    if (droppedOnSwitch) droppedDuringTransition++
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -483,6 +507,14 @@ fun CameraScreen() {
 
             // system
             Text("CPU:  ${String.format("%.1f", cpuUsagePercent)}%", color = Color.White, fontSize = 13.sp)
+
+            // stress-test counters — tap the mode button rapidly and watch these
+            Text("Switches: $transitionCount", color = Color.White, fontSize = 13.sp)
+            Text(
+                text = "Drop@Switch: $droppedDuringTransition",
+                color = if (droppedDuringTransition == 0) Color.Green else Color.Red,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold
+            )
         }
     }
 }
