@@ -32,6 +32,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import java.nio.ByteBuffer
@@ -179,6 +182,11 @@ fun CameraScreen() {
     var droppedDuringTransition by remember { mutableStateOf(0) }
     val lastModeRef = remember { intArrayOf(0) }  // mutable from the callback, same trick as lastHwTimestampNs
 
+    // phase 3 stage 6 — keeps an eye on frame time spikes and soc temperature under sustained load
+    var jitterCount  by remember { mutableStateOf(0) }
+    var thermalTempC by remember { mutableStateOf(-1.0) }
+    val rollingE2eMs = remember { doubleArrayOf(0.0) }  // callback-mutable like lastHwTimestampNs
+
     // phase 3 stage 1 — GPU init + pass-through SSBO verification result
     var gpuInitResult by remember { mutableStateOf<String?>(null) }
     // phase 3 stage 3: did the gpu sobel pass or fail the correctness check
@@ -215,6 +223,13 @@ fun CameraScreen() {
         while (true) {
             cpuUsagePercent = measureCpuUsage()
             delay(500)
+        }
+    }
+    // battery temp updates slowly so 2 s is plenty
+    LaunchedEffect(Unit) {
+        while (true) {
+            thermalTempC = readBatteryTemp(context)
+            delay(2000)
         }
     }
     DisposableEffect(Unit) {
@@ -323,6 +338,13 @@ fun CameraScreen() {
                 val procLatency = System.currentTimeMillis() - processingStart
                 val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
 
+                // flag frames where e2e blows past 2x the running average
+                val avg = rollingE2eMs[0]
+                val isJitter = avg > 0.0 && e2eLatency > avg * 2.0
+                rollingE2eMs[0] = if (avg == 0.0) e2eLatency.toDouble()
+                                  else avg * 0.9 + e2eLatency * 0.1
+                if (isJitter) Log.w(TAG, "jitter: e2e=${e2eLatency}ms vs avg=${String.format("%.1f", avg)}ms")
+
                 val droppedOnSwitch = modeChanged && intervalMs > 40L
 
                 mainHandler.post {
@@ -343,6 +365,7 @@ fun CameraScreen() {
                     }
                     if (modeChanged) transitionCount++
                     if (droppedOnSwitch) droppedDuringTransition++
+                    if (isJitter) jitterCount++
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -508,11 +531,30 @@ fun CameraScreen() {
             // system
             Text("CPU:  ${String.format("%.1f", cpuUsagePercent)}%", color = Color.White, fontSize = 13.sp)
 
+            // goes yellow/red as the soc heats up — red usually means throttling
+            val tempDisplay = if (thermalTempC < 0) "--" else "${String.format("%.1f", thermalTempC)}°C"
+            Text(
+                text = "Temp: $tempDisplay",
+                color = when {
+                    thermalTempC < 0    -> Color.White
+                    thermalTempC < 40.0 -> Color.Green
+                    thermalTempC < 45.0 -> Color.Yellow
+                    else                -> Color.Red
+                },
+                fontSize = 13.sp
+            )
+
             // stress-test counters — tap the mode button rapidly and watch these
             Text("Switches: $transitionCount", color = Color.White, fontSize = 13.sp)
             Text(
                 text = "Drop@Switch: $droppedDuringTransition",
                 color = if (droppedDuringTransition == 0) Color.Green else Color.Red,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold
+            )
+
+            Text(
+                text = "Jitter: $jitterCount",
+                color = if (jitterCount < 10) Color.Green else Color.Yellow,
                 fontSize = 13.sp, fontWeight = FontWeight.Bold
             )
         }
@@ -533,6 +575,14 @@ suspend fun measureCpuUsage(): Double {
     val totalDelta = s2.sum() - s1.sum()
     val idleDelta  = (s2[3] + s2[4]) - (s1[3] + s1[4]) // index 3=idle, 4=iowait
     return if (totalDelta > 0) (totalDelta - idleDelta) * 100.0 / totalDelta else 0.0
+}
+
+// battery temp via sticky broadcast — no permissions needed, works on all stock devices
+// BatteryManager reports tenths of °C (e.g. 320 = 32.0°C); not cpu temp but tracks it under load
+fun readBatteryTemp(context: Context): Double {
+    val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    val raw = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+    return if (raw > 0) raw / 10.0 else -1.0
 }
 
 // opens rear camera and starts a repeating capture session targeting 30 fps.
