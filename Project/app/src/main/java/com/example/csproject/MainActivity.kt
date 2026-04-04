@@ -32,6 +32,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import java.nio.ByteBuffer
@@ -60,6 +63,7 @@ class MainActivity : ComponentActivity() {
         yBytes: ByteArray, uBytes: ByteArray, vBytes: ByteArray,
         width: Int, height: Int,
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int
+
     ): ByteArray
 
     // runs 3x3 sobel edge detection on an rgba buffer
@@ -105,6 +109,11 @@ class MainActivity : ComponentActivity() {
     external fun nativeVerifyGpuSobel(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
+
+    // phase 3 stage 4: hybrid sobel — NEON top half + GPU bottom half concurrently
+    external fun nativeHybridSobel(
+        rgbaBytes: ByteArray, width: Int, height: Int
+    ): ByteArray
 
     companion object {
         init {
@@ -158,7 +167,7 @@ fun CameraScreen() {
 
     // hold the latest rotated rgba bitmap for display
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    // 0=Baseline  1=SIMD  2=GPU — cycles on button tap
+    // 0=Baseline  1=SIMD  2=GPU  3=Hybrid — cycles on button tap
     var mode            by remember { mutableStateOf(0) }
     var simdCheckResult by remember { mutableStateOf<String?>(null) }
 
@@ -166,6 +175,17 @@ fun CameraScreen() {
     var baselineSobelMs by remember { mutableStateOf(0L) }
     var neonSobelMs     by remember { mutableStateOf(0L) }
     var gpuSobelMs      by remember { mutableStateOf(0L) }
+    var hybridSobelMs   by remember { mutableStateOf(0L) }
+
+    // phase 3 stage 5 — tracks mode switches and any frame drops that happen mid-transition
+    var transitionCount         by remember { mutableStateOf(0) }
+    var droppedDuringTransition by remember { mutableStateOf(0) }
+    val lastModeRef = remember { intArrayOf(0) }  // mutable from the callback, same trick as lastHwTimestampNs
+
+    // phase 3 stage 6 — keeps an eye on frame time spikes and soc temperature under sustained load
+    var jitterCount  by remember { mutableStateOf(0) }
+    var thermalTempC by remember { mutableStateOf(-1.0) }
+    val rollingE2eMs = remember { doubleArrayOf(0.0) }  // callback-mutable like lastHwTimestampNs
 
     // phase 3 stage 1 — GPU init + pass-through SSBO verification result
     var gpuInitResult by remember { mutableStateOf<String?>(null) }
@@ -203,6 +223,13 @@ fun CameraScreen() {
         while (true) {
             cpuUsagePercent = measureCpuUsage()
             delay(500)
+        }
+    }
+    // battery temp updates slowly so 2 s is plenty
+    LaunchedEffect(Unit) {
+        while (true) {
+            thermalTempC = readBatteryTemp(context)
+            delay(2000)
         }
     }
     DisposableEffect(Unit) {
@@ -276,11 +303,27 @@ fun CameraScreen() {
                     }
                 }
 
-                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU
+                // grab mode once so a button tap mid-frame can't mix two paths
+                var currentMode = mode
+                // gpu/hybrid before egl init would return an empty buffer → black flash
+                if ((currentMode == 2 || currentMode == 3) && !gpuInitDone[0]) {
+                    Log.w(TAG, "GPU not ready, falling back to Baseline for this frame")
+                    currentMode = 0
+                }
+
+                val oldMode = lastModeRef[0]
+                val modeChanged = currentMode != oldMode
+                lastModeRef[0] = currentMode
+                if (modeChanged) {
+                    Log.d(TAG, "mode switch: $oldMode → $currentMode")
+                }
+
+                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU  3=Hybrid
                 val sobelStart = System.currentTimeMillis()
-                val edgeBytes = when (mode) {
+                val edgeBytes = when (currentMode) {
                     1    -> activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
                     2    -> activity.nativeGpuSobel(rgbaBytes, image.width, image.height)
+                    3    -> activity.nativeHybridSobel(rgbaBytes, image.width, image.height)
                     else -> activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
                 }
                 val sobelLat = System.currentTimeMillis() - sobelStart
@@ -295,6 +338,15 @@ fun CameraScreen() {
                 val procLatency = System.currentTimeMillis() - processingStart
                 val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
 
+                // flag frames where e2e blows past 2x the running average
+                val avg = rollingE2eMs[0]
+                val isJitter = avg > 0.0 && e2eLatency > avg * 2.0
+                rollingE2eMs[0] = if (avg == 0.0) e2eLatency.toDouble()
+                                  else avg * 0.9 + e2eLatency * 0.1
+                if (isJitter) Log.w(TAG, "jitter: e2e=${e2eLatency}ms vs avg=${String.format("%.1f", avg)}ms")
+
+                val droppedOnSwitch = modeChanged && intervalMs > 40L
+
                 mainHandler.post {
                     currentFps          = fps
                     processingLatencyMs = procLatency
@@ -305,11 +357,15 @@ fun CameraScreen() {
                     frameIntervalMs     = intervalMs
                     processedBitmap     = bmp
                     // store latency per mode for speedup comparison
-                    when (mode) {
+                    when (currentMode) {
                         1    -> neonSobelMs     = sobelLat
                         2    -> gpuSobelMs      = sobelLat
+                        3    -> hybridSobelMs   = sobelLat
                         else -> baselineSobelMs = sobelLat
                     }
+                    if (modeChanged) transitionCount++
+                    if (droppedOnSwitch) droppedDuringTransition++
+                    if (isJitter) jitterCount++
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -358,9 +414,9 @@ fun CameraScreen() {
             )
         }
 
-        // cycle: Baseline → SIMD → GPU → Baseline
+        // cycle: Baseline → SIMD → GPU → Hybrid → Baseline
         Button(
-            onClick = { mode = (mode + 1) % 3 },
+            onClick = { mode = (mode + 1) % 4 },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 24.dp)
@@ -368,6 +424,7 @@ fun CameraScreen() {
             Text(when (mode) {
                 0    -> "Switch to SIMD"
                 1    -> "Switch to GPU"
+                2    -> "Switch to Hybrid"
                 else -> "Switch to Baseline"
             })
         }
@@ -383,8 +440,8 @@ fun CameraScreen() {
         ) {
             // mode header
             Text(
-                text = when (mode) { 0 -> "MODE: Baseline"; 1 -> "MODE: SIMD"; else -> "MODE: GPU" },
-                color = when (mode) { 0 -> Color.Cyan; 1 -> Color.Green; else -> Color(0xFFFF9800) },
+                text = when (mode) { 0 -> "MODE: Baseline"; 1 -> "MODE: SIMD"; 2 -> "MODE: GPU"; else -> "MODE: Hybrid" },
+                color = when (mode) { 0 -> Color.Cyan; 1 -> Color.Green; 2 -> Color(0xFFFF9800); else -> Color.Magenta },
                 fontSize = 13.sp, fontWeight = FontWeight.Bold
             )
 
@@ -446,17 +503,20 @@ fun CameraScreen() {
             }
 
             // speedup table — shown once at least two modes have been sampled
-            if (baselineSobelMs > 0 && (neonSobelMs > 0 || gpuSobelMs > 0)) {
+            if (baselineSobelMs > 0 && (neonSobelMs > 0 || gpuSobelMs > 0 || hybridSobelMs > 0)) {
                 Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-                Text("Base:  ${baselineSobelMs} ms", color = Color.Cyan,            fontSize = 13.sp)
+                Text("Base:   ${baselineSobelMs} ms", color = Color.Cyan,            fontSize = 13.sp)
                 if (neonSobelMs > 0)
-                    Text("NEON:  ${neonSobelMs} ms", color = Color.Green,            fontSize = 13.sp)
+                    Text("NEON:   ${neonSobelMs} ms", color = Color.Green,            fontSize = 13.sp)
                 if (gpuSobelMs  > 0)
-                    Text("GPU:   ${gpuSobelMs} ms",  color = Color(0xFFFF9800),      fontSize = 13.sp)
+                    Text("GPU:    ${gpuSobelMs} ms",  color = Color(0xFFFF9800),      fontSize = 13.sp)
+                if (hybridSobelMs > 0)
+                    Text("Hybrid: ${hybridSobelMs} ms", color = Color.Magenta,        fontSize = 13.sp)
                 // show speedup vs baseline for whichever accelerated modes have run
                 val bestMs = listOfNotNull(
-                    if (neonSobelMs > 0) neonSobelMs else null,
-                    if (gpuSobelMs  > 0) gpuSobelMs  else null
+                    if (neonSobelMs    > 0) neonSobelMs    else null,
+                    if (gpuSobelMs     > 0) gpuSobelMs     else null,
+                    if (hybridSobelMs  > 0) hybridSobelMs  else null
                 ).min()
                 val ratio = baselineSobelMs.toDouble() / bestMs.toDouble()
                 Text(
@@ -470,6 +530,33 @@ fun CameraScreen() {
 
             // system
             Text("CPU:  ${String.format("%.1f", cpuUsagePercent)}%", color = Color.White, fontSize = 13.sp)
+
+            // goes yellow/red as the soc heats up — red usually means throttling
+            val tempDisplay = if (thermalTempC < 0) "--" else "${String.format("%.1f", thermalTempC)}°C"
+            Text(
+                text = "Temp: $tempDisplay",
+                color = when {
+                    thermalTempC < 0    -> Color.White
+                    thermalTempC < 40.0 -> Color.Green
+                    thermalTempC < 45.0 -> Color.Yellow
+                    else                -> Color.Red
+                },
+                fontSize = 13.sp
+            )
+
+            // stress-test counters — tap the mode button rapidly and watch these
+            Text("Switches: $transitionCount", color = Color.White, fontSize = 13.sp)
+            Text(
+                text = "Drop@Switch: $droppedDuringTransition",
+                color = if (droppedDuringTransition == 0) Color.Green else Color.Red,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold
+            )
+
+            Text(
+                text = "Jitter: $jitterCount",
+                color = if (jitterCount < 10) Color.Green else Color.Yellow,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold
+            )
         }
     }
 }
@@ -488,6 +575,14 @@ suspend fun measureCpuUsage(): Double {
     val totalDelta = s2.sum() - s1.sum()
     val idleDelta  = (s2[3] + s2[4]) - (s1[3] + s1[4]) // index 3=idle, 4=iowait
     return if (totalDelta > 0) (totalDelta - idleDelta) * 100.0 / totalDelta else 0.0
+}
+
+// battery temp via sticky broadcast — no permissions needed, works on all stock devices
+// BatteryManager reports tenths of °C (e.g. 320 = 32.0°C); not cpu temp but tracks it under load
+fun readBatteryTemp(context: Context): Double {
+    val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    val raw = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+    return if (raw > 0) raw / 10.0 else -1.0
 }
 
 // opens rear camera and starts a repeating capture session targeting 30 fps.
