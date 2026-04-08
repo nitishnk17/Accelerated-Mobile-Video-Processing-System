@@ -207,7 +207,9 @@ fun CameraScreen() {
         )
     }
     val rotCanvases = remember { arrayOf(Canvas(rotBitmaps[0]), Canvas(rotBitmaps[1])) }
-    val rotMatrix   = remember { Matrix().apply { postRotate(90f) } }
+    // postRotate(90) maps (x,y)→(-y,x), which shifts the image to negative x.
+    // postTranslate(720,0) brings it back: the image spans x=[0,720], y=[0,1280]
+    val rotMatrix   = remember { Matrix().apply { postRotate(90f); postTranslate(720f, 0f) } }
     val backIdxRef  = remember { intArrayOf(0) }  // which rotBitmap the bg thread writes to next
     // lazily-sized yuv plane byte arrays; allocated on first frame, reused every frame after
     val yBufRef = remember { arrayOfNulls<ByteArray>(1) }
@@ -601,12 +603,8 @@ fun CameraScreen() {
     }
 }
 
-// phase 4 stage 1 — formats a nanosecond duration for display: ns → µs → ms
-fun fmtNs(ns: Long): String = when {
-    ns < 1_000L     -> "${ns} ns"
-    ns < 1_000_000L -> "${String.format("%.1f", ns / 1_000.0)} µs"
-    else            -> "${String.format("%.2f", ns / 1_000_000.0)} ms"
-}
+// phase 4 stage 1 — formats a nanosecond duration as milliseconds (2 decimal places)
+fun fmtNs(ns: Long): String = "${String.format("%.2f", ns / 1_000_000.0)} ms"
 
 // reads /proc/stat twice 500 ms apart and returns cpu busy percentage
 suspend fun measureCpuUsage(): Double {
