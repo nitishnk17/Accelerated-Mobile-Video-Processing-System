@@ -36,6 +36,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Matrix
 import java.nio.ByteBuffer
 import androidx.compose.foundation.Image
@@ -156,14 +157,16 @@ fun CameraScreen() {
     val context = LocalContext.current
 
     // dashboard state — each var triggers only its own text to recompose
-    var currentFps          by remember { mutableStateOf(0.0) }
-    var processingLatencyMs by remember { mutableStateOf(0L) }
-    var conversionLatencyMs by remember { mutableStateOf(0L) }
-    var sobelLatencyMs      by remember { mutableStateOf(0L) }
-    var jniLatencyMs        by remember { mutableStateOf(0L) }
-    var endToEndLatencyMs   by remember { mutableStateOf(0L) }
-    var cpuUsagePercent     by remember { mutableStateOf(0.0) }
-    var frameIntervalMs     by remember { mutableStateOf(-1L) }
+    var currentFps       by remember { mutableStateOf(0.0) }
+    // phase 4 stage 1 — nanosecond-precision per-stage latency breakdown
+    var yuvExtractNs     by remember { mutableStateOf(0L) }
+    var conversionNs     by remember { mutableStateOf(0L) }
+    var sobelNs          by remember { mutableStateOf(0L) }
+    var bitmapCreateNs   by remember { mutableStateOf(0L) }
+    var bitmapRotateNs   by remember { mutableStateOf(0L) }
+    var endToEndNs       by remember { mutableStateOf(0L) }
+    var cpuUsagePercent  by remember { mutableStateOf(0.0) }
+    var frameIntervalMs  by remember { mutableStateOf(-1L) }
 
     // hold the latest rotated rgba bitmap for display
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -171,11 +174,11 @@ fun CameraScreen() {
     var mode            by remember { mutableStateOf(0) }
     var simdCheckResult by remember { mutableStateOf<String?>(null) }
 
-    // track sobel latency per mode for speedup comparison
-    var baselineSobelMs by remember { mutableStateOf(0L) }
-    var neonSobelMs     by remember { mutableStateOf(0L) }
-    var gpuSobelMs      by remember { mutableStateOf(0L) }
-    var hybridSobelMs   by remember { mutableStateOf(0L) }
+    // track sobel latency per mode for speedup comparison (ns)
+    var baselineSobelNs by remember { mutableStateOf(0L) }
+    var neonSobelNs     by remember { mutableStateOf(0L) }
+    var gpuSobelNs      by remember { mutableStateOf(0L) }
+    var hybridSobelNs   by remember { mutableStateOf(0L) }
 
     // phase 3 stage 5 — tracks mode switches and any frame drops that happen mid-transition
     var transitionCount         by remember { mutableStateOf(0) }
@@ -193,6 +196,23 @@ fun CameraScreen() {
     var gpuSobelCheckResult by remember { mutableStateOf<String?>(null) }
     val gpuInitDone   = remember { booleanArrayOf(false) }  // run only once, on first frame
 
+    // phase 4 stage 2 — pre-allocated buffers to eliminate per-frame GC pressure
+    // rawBmp: un-rotated edge output; reused via copyPixelsFromBuffer (no allocation)
+    val rawBmp = remember { Bitmap.createBitmap(1280, 720, Bitmap.Config.ARGB_8888) }
+    // double-buffered rotated bitmaps: background writes to back, UI reads front
+    val rotBitmaps  = remember {
+        arrayOf(
+            Bitmap.createBitmap(720, 1280, Bitmap.Config.ARGB_8888),
+            Bitmap.createBitmap(720, 1280, Bitmap.Config.ARGB_8888)
+        )
+    }
+    val rotCanvases = remember { arrayOf(Canvas(rotBitmaps[0]), Canvas(rotBitmaps[1])) }
+    val rotMatrix   = remember { Matrix().apply { postRotate(90f) } }
+    val backIdxRef  = remember { intArrayOf(0) }  // which rotBitmap the bg thread writes to next
+    // lazily-sized yuv plane byte arrays; allocated on first frame, reused every frame after
+    val yBufRef = remember { arrayOfNulls<ByteArray>(1) }
+    val uBufRef = remember { arrayOfNulls<ByteArray>(1) }
+    val vBufRef = remember { arrayOfNulls<ByteArray>(1) }
 
     // need a reference to the activity to call the jni method
     val activity = context as MainActivity
@@ -234,12 +254,15 @@ fun CameraScreen() {
     }
     DisposableEffect(Unit) {
         imageReader.setOnImageAvailableListener({ reader ->
-            val frameArrivalTime = System.currentTimeMillis()
+            // phase 4 stage 1 — nanosecond capture timestamp; drives e2e latency
+            val frameArrivalNs = System.nanoTime()
+            // currentTimeMillis still used for the fps rolling window (wall-clock ms is fine there)
+            val frameArrivalWallMs = System.currentTimeMillis()
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
 
             try {
                 // rolling 30-frame fps average
-                frameTimestamps.addLast(frameArrivalTime)
+                frameTimestamps.addLast(frameArrivalWallMs)
                 if (frameTimestamps.size > 30) frameTimestamps.removeFirst()
                 val fps = if (frameTimestamps.size >= 2) {
                     val spanMs = frameTimestamps.last() - frameTimestamps.first()
@@ -255,23 +278,30 @@ fun CameraScreen() {
                 Log.d(TAG, "frame: hw=${hwTimestampNs / 1_000_000}ms  interval=${intervalMs}ms")
                 if (intervalMs > 40L) Log.w(TAG, "frame gap ${intervalMs}ms — possible dropped frame")
 
-                val processingStart = System.currentTimeMillis()
-
-                // copy yuv planes into byte arrays for jni
+                // stage 1: yuv plane extraction — reuse pre-allocated byte arrays (no GC alloc after first frame)
+                val yuvExtractStart = System.nanoTime()
                 val yPlane = image.planes[0]
                 val uPlane = image.planes[1]
                 val vPlane = image.planes[2]
-                val yBytes = ByteArray(yPlane.buffer.remaining()).also { yPlane.buffer.get(it) }
-                val uBytes = ByteArray(uPlane.buffer.remaining()).also { uPlane.buffer.get(it) }
-                val vBytes = ByteArray(vPlane.buffer.remaining()).also { vPlane.buffer.get(it) }
+                val ySize = yPlane.buffer.remaining()
+                val uSize = uPlane.buffer.remaining()
+                val vSize = vPlane.buffer.remaining()
+                if (yBufRef[0]?.size != ySize) yBufRef[0] = ByteArray(ySize)
+                if (uBufRef[0]?.size != uSize) uBufRef[0] = ByteArray(uSize)
+                if (vBufRef[0]?.size != vSize) vBufRef[0] = ByteArray(vSize)
+                val yBytes = yBufRef[0]!!.also { yPlane.buffer.get(it) }
+                val uBytes = uBufRef[0]!!.also { uPlane.buffer.get(it) }
+                val vBytes = vBufRef[0]!!.also { vPlane.buffer.get(it) }
+                val yuvExtractNsVal = System.nanoTime() - yuvExtractStart
 
-                val convStart = System.currentTimeMillis()
+                // stage 2: yuv→rgba conversion (jni)
+                val convStartNs = System.nanoTime()
                 val rgbaBytes = activity.nativeYuvToRgba(
                     yBytes, uBytes, vBytes,
                     image.width, image.height,
                     yPlane.rowStride, uPlane.rowStride, uPlane.pixelStride
                 )
-                val convLatency = System.currentTimeMillis() - convStart
+                val convNsVal = System.nanoTime() - convStartNs
 
                 // phase 2 stage 3 — one shot neon correctness check on the first frame
                 if (!verifyOnce[0]) {
@@ -318,50 +348,57 @@ fun CameraScreen() {
                     Log.d(TAG, "mode switch: $oldMode → $currentMode")
                 }
 
+                // stage 3: sobel (active mode)
+                val sobelStartNs = System.nanoTime()
                 // route frame to active mode: 0=Baseline  1=SIMD  2=GPU  3=Hybrid
-                val sobelStart = System.currentTimeMillis()
                 val edgeBytes = when (currentMode) {
                     1    -> activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
                     2    -> activity.nativeGpuSobel(rgbaBytes, image.width, image.height)
                     3    -> activity.nativeHybridSobel(rgbaBytes, image.width, image.height)
                     else -> activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
                 }
-                val sobelLat = System.currentTimeMillis() - sobelStart
+                val sobelNsVal = System.nanoTime() - sobelStartNs
 
-                // build bitmap from rgba bytes and rotate 90° to match display orientation
-                val rawBmp = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                // stage 4: fill pre-allocated rawBmp with edge pixels — no Bitmap allocation
+                val bmpCreateStartNs = System.nanoTime()
                 rawBmp.copyPixelsFromBuffer(ByteBuffer.wrap(edgeBytes))
-                val matrix = Matrix().apply { postRotate(90f) }
-                val bmp = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
-                rawBmp.recycle()
+                val bmpCreateNsVal = System.nanoTime() - bmpCreateStartNs
 
-                val procLatency = System.currentTimeMillis() - processingStart
-                val e2eLatency  = System.currentTimeMillis() - frameArrivalTime
+                // stage 5: draw into the back-buffer rotated Bitmap via pre-allocated Canvas — no allocation
+                val bmpRotateStartNs = System.nanoTime()
+                val backIdx = backIdxRef[0]
+                rotCanvases[backIdx].drawBitmap(rawBmp, rotMatrix, null)
+                backIdxRef[0] = 1 - backIdx  // flip immediately so next frame uses the other buffer
+                val bmpRotateNsVal = System.nanoTime() - bmpRotateStartNs
 
-                // flag frames where e2e blows past 2x the running average
+                // total e2e from camera frame arrival to display-ready
+                val e2eNsVal = System.nanoTime() - frameArrivalNs
+
+                // flag frames where e2e blows past 2x the running average (compare in ms)
+                val e2eMs = e2eNsVal / 1_000_000.0
                 val avg = rollingE2eMs[0]
-                val isJitter = avg > 0.0 && e2eLatency > avg * 2.0
-                rollingE2eMs[0] = if (avg == 0.0) e2eLatency.toDouble()
-                                  else avg * 0.9 + e2eLatency * 0.1
-                if (isJitter) Log.w(TAG, "jitter: e2e=${e2eLatency}ms vs avg=${String.format("%.1f", avg)}ms")
+                val isJitter = avg > 0.0 && e2eMs > avg * 2.0
+                rollingE2eMs[0] = if (avg == 0.0) e2eMs else avg * 0.9 + e2eMs * 0.1
+                if (isJitter) Log.w(TAG, "jitter: e2e=${String.format("%.2f", e2eMs)}ms vs avg=${String.format("%.2f", avg)}ms")
 
                 val droppedOnSwitch = modeChanged && intervalMs > 40L
 
                 mainHandler.post {
-                    currentFps          = fps
-                    processingLatencyMs = procLatency
-                    conversionLatencyMs = convLatency
-                    sobelLatencyMs      = sobelLat
-                    jniLatencyMs        = convLatency + sobelLat
-                    endToEndLatencyMs   = e2eLatency
-                    frameIntervalMs     = intervalMs
-                    processedBitmap     = bmp
-                    // store latency per mode for speedup comparison
+                    currentFps      = fps
+                    yuvExtractNs    = yuvExtractNsVal
+                    conversionNs    = convNsVal
+                    sobelNs         = sobelNsVal
+                    bitmapCreateNs  = bmpCreateNsVal
+                    bitmapRotateNs  = bmpRotateNsVal
+                    endToEndNs      = e2eNsVal
+                    frameIntervalMs = intervalMs
+                    processedBitmap = rotBitmaps[backIdx]  // show the just-written back buffer
+                    // store sobel latency per mode for speedup comparison (ns)
                     when (currentMode) {
-                        1    -> neonSobelMs     = sobelLat
-                        2    -> gpuSobelMs      = sobelLat
-                        3    -> hybridSobelMs   = sobelLat
-                        else -> baselineSobelMs = sobelLat
+                        1    -> neonSobelNs     = sobelNsVal
+                        2    -> gpuSobelNs      = sobelNsVal
+                        3    -> hybridSobelNs   = sobelNsVal
+                        else -> baselineSobelNs = sobelNsVal
                     }
                     if (modeChanged) transitionCount++
                     if (droppedOnSwitch) droppedDuringTransition++
@@ -414,19 +451,20 @@ fun CameraScreen() {
             )
         }
 
-        // cycle: Baseline → SIMD → GPU → Hybrid → Baseline
+        // cycle: Baseline (0) → SIMD (1) → GPU (2) → Hybrid (3) → Baseline (0)
         Button(
             onClick = { mode = (mode + 1) % 4 },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 24.dp)
         ) {
-            Text(when (mode) {
-                0    -> "Switch to SIMD"
-                1    -> "Switch to GPU"
-                2    -> "Switch to Hybrid"
-                else -> "Switch to Baseline"
-            })
+            val (current, next) = when (mode) {
+                0    -> "Baseline" to "SIMD"
+                1    -> "SIMD"     to "GPU"
+                2    -> "GPU"      to "Hybrid"
+                else -> "Hybrid"   to "Baseline"
+            }
+            Text("Active: $current ➔ Next: $next")
         }
 
         // semi-transparent hud pinned to top-left corner
@@ -464,11 +502,13 @@ fun CameraScreen() {
 
             Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
 
-            // latency breakdown
-            Text("JNI:   ${jniLatencyMs} ms",          color = Color.Cyan,  fontSize = 13.sp, fontWeight = FontWeight.Bold)
-            Text("Conv:  ${conversionLatencyMs} ms",   color = Color.White, fontSize = 13.sp)
-            Text("Sobel: ${sobelLatencyMs} ms",        color = Color.White, fontSize = 13.sp)
-            Text("E2E:   ${endToEndLatencyMs} ms",     color = Color.White, fontSize = 13.sp)
+            // phase 4 stage 1 — nanosecond pipeline breakdown
+            Text("YUV:    ${fmtNs(yuvExtractNs)}",  color = Color.White, fontSize = 13.sp)
+            Text("Conv:   ${fmtNs(conversionNs)}",  color = Color.White, fontSize = 13.sp)
+            Text("Sobel:  ${fmtNs(sobelNs)}",       color = Color.Cyan,  fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Text("BmpMk:  ${fmtNs(bitmapCreateNs)}",color = Color.White, fontSize = 13.sp)
+            Text("BmpRot: ${fmtNs(bitmapRotateNs)}",color = Color.White, fontSize = 13.sp)
+            Text("E2E:    ${fmtNs(endToEndNs)}",    color = Color.Yellow,fontSize = 13.sp, fontWeight = FontWeight.Bold)
 
             Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
 
@@ -502,23 +542,23 @@ fun CameraScreen() {
                 )
             }
 
-            // speedup table — shown once at least two modes have been sampled
-            if (baselineSobelMs > 0 && (neonSobelMs > 0 || gpuSobelMs > 0 || hybridSobelMs > 0)) {
+            // speedup table — shown once at least two modes have been sampled (ns precision)
+            if (baselineSobelNs > 0 && (neonSobelNs > 0 || gpuSobelNs > 0 || hybridSobelNs > 0)) {
                 Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-                Text("Base:   ${baselineSobelMs} ms", color = Color.Cyan,            fontSize = 13.sp)
-                if (neonSobelMs > 0)
-                    Text("NEON:   ${neonSobelMs} ms", color = Color.Green,            fontSize = 13.sp)
-                if (gpuSobelMs  > 0)
-                    Text("GPU:    ${gpuSobelMs} ms",  color = Color(0xFFFF9800),      fontSize = 13.sp)
-                if (hybridSobelMs > 0)
-                    Text("Hybrid: ${hybridSobelMs} ms", color = Color.Magenta,        fontSize = 13.sp)
+                Text("Base:   ${fmtNs(baselineSobelNs)}", color = Color.Cyan,       fontSize = 13.sp)
+                if (neonSobelNs > 0)
+                    Text("NEON:   ${fmtNs(neonSobelNs)}", color = Color.Green,       fontSize = 13.sp)
+                if (gpuSobelNs  > 0)
+                    Text("GPU:    ${fmtNs(gpuSobelNs)}",  color = Color(0xFFFF9800), fontSize = 13.sp)
+                if (hybridSobelNs > 0)
+                    Text("Hybrid: ${fmtNs(hybridSobelNs)}", color = Color.Magenta,   fontSize = 13.sp)
                 // show speedup vs baseline for whichever accelerated modes have run
-                val bestMs = listOfNotNull(
-                    if (neonSobelMs    > 0) neonSobelMs    else null,
-                    if (gpuSobelMs     > 0) gpuSobelMs     else null,
-                    if (hybridSobelMs  > 0) hybridSobelMs  else null
+                val bestNs = listOfNotNull(
+                    if (neonSobelNs   > 0) neonSobelNs   else null,
+                    if (gpuSobelNs    > 0) gpuSobelNs    else null,
+                    if (hybridSobelNs > 0) hybridSobelNs else null
                 ).min()
-                val ratio = baselineSobelMs.toDouble() / bestMs.toDouble()
+                val ratio = baselineSobelNs.toDouble() / bestNs.toDouble()
                 Text(
                     text = "Speedup: ${String.format("%.1f", ratio)}×",
                     color = Color.Yellow,
@@ -559,6 +599,13 @@ fun CameraScreen() {
             )
         }
     }
+}
+
+// phase 4 stage 1 — formats a nanosecond duration for display: ns → µs → ms
+fun fmtNs(ns: Long): String = when {
+    ns < 1_000L     -> "${ns} ns"
+    ns < 1_000_000L -> "${String.format("%.1f", ns / 1_000.0)} µs"
+    else            -> "${String.format("%.2f", ns / 1_000_000.0)} ms"
 }
 
 // reads /proc/stat twice 500 ms apart and returns cpu busy percentage

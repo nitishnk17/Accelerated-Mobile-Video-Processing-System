@@ -503,6 +503,12 @@ static EGLSurface g_eglSurface = EGL_NO_SURFACE;  // 1×1 pbuffer (needed to mak
 static GLuint g_passthroughProgram = 0;  // phase 3 stage 1 — SSBO copy verification
 static GLuint g_sobelProgram       = 0;  // phase 3 stage 2 — GPU Sobel edge detection
 
+// phase 4 stage 2 — persistent SSBOs; allocated once, updated via glBufferSubData each frame
+// avoids glGenBuffers/glDeleteBuffers overhead (GPU memory allocator round-trip) at 30 fps
+static GLuint g_ssboIn    = 0;  // input  SSBO (full frame, totalBytes)
+static GLuint g_ssboOut   = 0;  // output SSBO (full frame, totalBytes); hybrid reads bottomBytes portion
+static int    g_ssboBytes = 0;  // currently allocated size; 0 = not yet created
+
 // helper: compile a single compute shader from GLSL source and link it into a program
 // returns the program id on success, 0 on any error (details logged to logcat)
 static GLuint compileComputeProgram(const char* source) {
@@ -861,21 +867,27 @@ Java_com_example_csproject_MainActivity_nativeGpuSobel(
     jbyte* srcBytes = (jbyte*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
     jbyte* dstBytes = (jbyte*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
 
-    // --- upload input pixels to SSBO at binding 0 ---
-    GLuint ssboIn = 0, ssboOut = 0;
-    glGenBuffers(1, &ssboIn);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboIn);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, srcBytes, GL_STATIC_READ);
-
-    // --- create empty output SSBO at binding 1 ---
-    glGenBuffers(1, &ssboOut);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_STATIC_COPY);
+    // phase 4 stage 2 — reuse persistent SSBOs; only (re)allocate storage if frame size changed
+    if (g_ssboIn == 0) {
+        glGenBuffers(1, &g_ssboIn);
+        glGenBuffers(1, &g_ssboOut);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboIn);
+    if (g_ssboBytes != totalBytes) {
+        // first call or resolution change: allocate GPU storage with DYNAMIC_DRAW hint
+        glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_DYNAMIC_DRAW);
+        g_ssboBytes = totalBytes;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboIn);
+    }
+    // upload input data without reallocating GPU memory
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, totalBytes, srcBytes);
 
     // --- bind program and SSBOs, set image dimensions ---
     glUseProgram(g_sobelProgram);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboIn);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboOut);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_ssboIn);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_ssboOut);
     glUniform1i(glGetUniformLocation(g_sobelProgram, "uWidth"),     width);
     glUniform1i(glGetUniformLocation(g_sobelProgram, "uHeight"),    height);
     glUniform1i(glGetUniformLocation(g_sobelProgram, "uRowOffset"), 0);
@@ -890,7 +902,7 @@ Java_com_example_csproject_MainActivity_nativeGpuSobel(
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
     // --- read back the edge-detected pixels ---
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
     void* gpuData = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, totalBytes, GL_MAP_READ_BIT);
     if (gpuData) {
         memcpy(dstBytes, gpuData, totalBytes);
@@ -898,9 +910,7 @@ Java_com_example_csproject_MainActivity_nativeGpuSobel(
     } else {
         LOGI("nativeGpuSobel: glMapBufferRange returned null — readback failed");
     }
-
-    glDeleteBuffers(1, &ssboIn);
-    glDeleteBuffers(1, &ssboOut);
+    // SSBOs are persistent — no glDeleteBuffers
 
     env->ReleasePrimitiveArrayCritical(rgbaInput,   srcBytes, JNI_ABORT);
     env->ReleasePrimitiveArrayCritical(outputArray, dstBytes, 0);
@@ -1119,20 +1129,26 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
     int bottomRows  = height - midRow;
     int bottomBytes = bottomRows * width * 4;
 
-    GLuint ssboIn = 0, ssboOut = 0;
-
-    // full input needed so the shader can read neighbor rows across the split
-    glGenBuffers(1, &ssboIn);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboIn);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, inputBuf, GL_STATIC_READ);
-
-    glGenBuffers(1, &ssboOut);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, bottomBytes, nullptr, GL_STATIC_COPY);
+    // phase 4 stage 2 — reuse persistent SSBOs; same buffers as nativeGpuSobel
+    // g_ssboOut is sized totalBytes; we only read bottomBytes from it for the bottom half
+    if (g_ssboIn == 0) {
+        glGenBuffers(1, &g_ssboIn);
+        glGenBuffers(1, &g_ssboOut);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboIn);
+    if (g_ssboBytes != totalBytes) {
+        glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_DYNAMIC_DRAW);
+        g_ssboBytes = totalBytes;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboIn);
+    }
+    // full input so the shader can read neighbor rows across the split boundary
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, totalBytes, inputBuf);
 
     glUseProgram(g_sobelProgram);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboIn);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboOut);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_ssboIn);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_ssboOut);
     glUniform1i(glGetUniformLocation(g_sobelProgram, "uWidth"),     width);
     glUniform1i(glGetUniformLocation(g_sobelProgram, "uHeight"),    height);
     glUniform1i(glGetUniformLocation(g_sobelProgram, "uRowOffset"), midRow);
@@ -1142,7 +1158,7 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
     glDispatchCompute(groupsX, groupsY, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboOut);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
     void* gpuData = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, bottomBytes, GL_MAP_READ_BIT);
     if (gpuData) {
         memcpy(outputBuf + midRow * width * 4, gpuData, bottomBytes);
@@ -1150,9 +1166,7 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
     } else {
         LOGI("nativeHybridSobel: GPU readback failed, bottom half will be black");
     }
-
-    glDeleteBuffers(1, &ssboIn);
-    glDeleteBuffers(1, &ssboOut);
+    // SSBOs are persistent — no glDeleteBuffers
 
     neonThread.join();
 
