@@ -252,11 +252,30 @@ Java_com_example_csproject_MainActivity_nativeSobelNeon(
         uint8_t* midRowPtr = inputBuf + row        * width * 4;  // current row
         uint8_t* botRowPtr = inputBuf + nextRowIdx * width * 4;  // row below current
 
+        // phase 4 stage 3 — row-level prefetch: load the row 2 ahead into L2 cache
+        // covers the full width in 64-byte cache lines (1280*4 = 5120 bytes = 80 lines)
+        // locality=1: low — we visit each row once and won't need it again
+        if (row + 2 < height) {
+            const uint8_t* prefetchRow = inputBuf + (row + 2) * width * 4;
+            for (int p = 0; p < width * 4; p += 64)
+                __builtin_prefetch(prefetchRow + p, 0, 1);
+        }
+
         // left margin:  col - 1 >= 0  -> col >= 1
         // right margin: col + 16 < width  ->  col + 16 <= width - 1
         // so valid neon range is col = 1 .. (width - 17)
         int col = 1;
         for (; col + 16 <= width - 1; col += 16) {
+
+            // phase 4 stage 3 — column-level prefetch: issue 2 chunks (32 pixels) ahead
+            // each vld4q_u8 reads 64 bytes; 3 rows x 3 positions = 9 loads per iteration
+            // prefetching 32 pixels ahead (128 bytes) gives ~10-20 cycles lead time on ARM
+            // locality=2: moderate — the data lands in L1 and stays warm for the inner loop
+            __builtin_prefetch(topRowPtr + (col + 32) * 4, 0, 2);
+            __builtin_prefetch(midRowPtr + (col + 32) * 4, 0, 2);
+            __builtin_prefetch(botRowPtr + (col + 32) * 4, 0, 2);
+            // write prefetch for the output destination 2 chunks ahead
+            __builtin_prefetch(dstRow    + (col + 32) * 4, 1, 1);
 
             // load 16 rgba pixels from each of the 8 neighbor positions in the 3x3 window
             // vld4q_u8 reads 64 bytes and deinterleaves into 4 channel vectors of 16 values each:
@@ -295,7 +314,7 @@ Java_com_example_csproject_MainActivity_nativeSobelNeon(
                 //              [-1  0  +1]
 
                 // positive side (right column weights +1, +2, +1)
-                // vaddl_u8 widens uint8 → uint16 before adding to prevent overflow
+                // vaddl_u8 widens uint8 -> uint16 before adding to prevent overflow
                 uint16x8_t gxPosLow  = vaddl_u8(vget_low_u8(tR),  vget_low_u8(bR));
                 uint16x8_t gxPosHigh = vaddl_u8(vget_high_u8(tR), vget_high_u8(bR));
                 gxPosLow  = vmlal_u8(gxPosLow,  vget_low_u8(mR),  vdup_n_u8(2));  // += mR * 2
@@ -608,10 +627,10 @@ void main() {
         int mLv = int(chan(mL,ch));                               int mRv = int(chan(mR,ch));
         int bLv = int(chan(bL,ch));  int bCv = int(chan(bC,ch));  int bRv = int(chan(bR,ch));
 
-        // Gx kernel: [-1  0 +1 / -2  0 +2 / -1  0 +1]  →  right column minus left column
+        // Gx kernel: [-1  0 +1 / -2  0 +2 / -1  0 +1]  ->  right column minus left column
         int absGx = abs((tRv + 2*mRv + bRv) - (tLv + 2*mLv + bLv));
 
-        // Gy kernel: [-1 -2 -1 /  0  0  0 / +1 +2 +1]  →  bottom row minus top row
+        // Gy kernel: [-1 -2 -1 /  0  0  0 / +1 +2 +1]  ->  bottom row minus top row
         int absGy = abs((bLv + 2*bCv + bRv) - (tLv + 2*tCv + tRv));
 
         // L1/2 magnitude — identical formula to nativeSobelFilter and nativeSobelNeon
@@ -989,8 +1008,21 @@ static void sobelNeonRows(const uint8_t* inputBuf, uint8_t* outputBuf,
         const uint8_t* midRowPtr = inputBuf + row        * width * 4;
         const uint8_t* botRowPtr = inputBuf + nextRowIdx * width * 4;
 
+        // phase 4 stage 3 — row-level prefetch: same strategy as nativeSobelNeon
+        if (row + 2 < height) {
+            const uint8_t* prefetchRow = inputBuf + (row + 2) * width * 4;
+            for (int p = 0; p < width * 4; p += 64)
+                __builtin_prefetch(prefetchRow + p, 0, 1);
+        }
+
         int col = 1;
         for (; col + 16 <= width - 1; col += 16) {
+
+            // phase 4 stage 3 — column-level prefetch: 32 pixels ahead per row
+            __builtin_prefetch(topRowPtr + (col + 32) * 4, 0, 2);
+            __builtin_prefetch(midRowPtr + (col + 32) * 4, 0, 2);
+            __builtin_prefetch(botRowPtr + (col + 32) * 4, 0, 2);
+            __builtin_prefetch(dstRow    + (col + 32) * 4, 1, 1);
 
             uint8x16x4_t topLeft    = vld4q_u8(topRowPtr + (col - 1) * 4);
             uint8x16x4_t topCenter  = vld4q_u8(topRowPtr +  col      * 4);
