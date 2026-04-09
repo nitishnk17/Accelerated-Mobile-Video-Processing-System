@@ -207,7 +207,7 @@ fun CameraScreen() {
         )
     }
     val rotCanvases = remember { arrayOf(Canvas(rotBitmaps[0]), Canvas(rotBitmaps[1])) }
-    // postRotate(90) maps (x,y)→(-y,x), which shifts the image to negative x.
+    // postRotate(90) maps (x,y)->(-y,x), which shifts the image to negative x.
     // postTranslate(720,0) brings it back: the image spans x=[0,720], y=[0,1280]
     val rotMatrix   = remember { Matrix().apply { postRotate(90f); postTranslate(720f, 0f) } }
     val backIdxRef  = remember { intArrayOf(0) }  // which rotBitmap the bg thread writes to next
@@ -296,7 +296,7 @@ fun CameraScreen() {
                 val vBytes = vBufRef[0]!!.also { vPlane.buffer.get(it) }
                 val yuvExtractNsVal = System.nanoTime() - yuvExtractStart
 
-                // stage 2: yuv→rgba conversion (jni)
+                // stage 2: yuv->rgba conversion (jni)
                 val convStartNs = System.nanoTime()
                 val rgbaBytes = activity.nativeYuvToRgba(
                     yBytes, uBytes, vBytes,
@@ -337,7 +337,7 @@ fun CameraScreen() {
 
                 // grab mode once so a button tap mid-frame can't mix two paths
                 var currentMode = mode
-                // gpu/hybrid before egl init would return an empty buffer → black flash
+                // gpu/hybrid before egl init would return an empty buffer -> black flash
                 if ((currentMode == 2 || currentMode == 3) && !gpuInitDone[0]) {
                     Log.w(TAG, "GPU not ready, falling back to Baseline for this frame")
                     currentMode = 0
@@ -347,7 +347,7 @@ fun CameraScreen() {
                 val modeChanged = currentMode != oldMode
                 lastModeRef[0] = currentMode
                 if (modeChanged) {
-                    Log.d(TAG, "mode switch: $oldMode → $currentMode")
+                    Log.d(TAG, "mode switch: $oldMode -> $currentMode")
                 }
 
                 // stage 3: sobel (active mode)
@@ -453,7 +453,7 @@ fun CameraScreen() {
             )
         }
 
-        // cycle: Baseline (0) → SIMD (1) → GPU (2) → Hybrid (3) → Baseline (0)
+        // cycle: Baseline (0) -> SIMD (1) -> GPU (2) -> Hybrid (3) -> Baseline (0)
         Button(
             onClick = { mode = (mode + 1) % 4 },
             modifier = Modifier
@@ -466,7 +466,7 @@ fun CameraScreen() {
                 2    -> "GPU"      to "Hybrid"
                 else -> "Hybrid"   to "Baseline"
             }
-            Text("Active: $current ➔ Next: $next")
+            Text("Active: $current -> Next: $next")
         }
 
         // semi-transparent hud pinned to top-left corner
@@ -654,7 +654,7 @@ fun openCamera(
     val availableFpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
     val targetFpsRange     = availableFpsRanges?.firstOrNull { it.lower == 30 && it.upper == 30 }
                           ?: availableFpsRanges?.maxByOrNull { it.upper }
-    Log.d(TAG, "fps ranges: ${availableFpsRanges?.toList()} → selected: $targetFpsRange")
+    Log.d(TAG, "fps ranges: ${availableFpsRanges?.toList()} -> selected: $targetFpsRange")
 
     surfaceTexture.setDefaultBufferSize(1280, 720)
     val previewSurface = Surface(surfaceTexture)
