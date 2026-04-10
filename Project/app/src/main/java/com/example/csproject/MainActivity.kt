@@ -123,6 +123,11 @@ class MainActivity : ComponentActivity() {
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
 
+    // phase 4 stage 5 — peek at the adaptive hybrid split state. writes into a
+    // caller-owned long[3]: [midRow, lastNeonHalfNs, lastGpuHalfNs]. takes the
+    // buffer as a param so we don't allocate a fresh LongArray every hybrid frame.
+    external fun nativeGetHybridStats(out: LongArray)
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -187,6 +192,13 @@ fun CameraScreen() {
     var gpuSobelNs      by remember { mutableStateOf(0L) }
     var hybridSobelNs   by remember { mutableStateOf(0L) }
 
+    // phase 4 stage 5 — adaptive hybrid split telemetry, pulled from native once per
+    // hybrid frame. midRow == 0 means "haven't seen a hybrid frame yet" — we gate
+    // the dashboard row on that so cold-start doesn't flash a meaningless "0 rows".
+    var hybridMidRow     by remember { mutableStateOf(0) }
+    var hybridNeonHalfNs by remember { mutableStateOf(0L) }
+    var hybridGpuHalfNs  by remember { mutableStateOf(0L) }
+
     // phase 3 stage 5 — tracks mode switches and any frame drops that happen mid-transition
     var transitionCount         by remember { mutableStateOf(0) }
     var droppedDuringTransition by remember { mutableStateOf(0) }
@@ -222,6 +234,9 @@ fun CameraScreen() {
     val backIdxRef  = remember { intArrayOf(0) }  // which rotBitmap the bg thread writes to next
     // lazily-sized yuv plane byte arrays; allocated on first frame, reused every frame after
     val yBufRef = remember { arrayOfNulls<ByteArray>(1) }
+    // phase 4 stage 5 — preallocated scratch for nativeGetHybridStats so the jni
+    // call doesn't allocate a fresh long[] per hybrid frame
+    val hybridStatsBuf = remember { LongArray(3) }
     val uBufRef = remember { arrayOfNulls<ByteArray>(1) }
     val vBufRef = remember { arrayOfNulls<ByteArray>(1) }
 
@@ -377,6 +392,23 @@ fun CameraScreen() {
                 }
                 val sobelNsVal = System.nanoTime() - sobelStartNs
 
+                // phase 4 stage 5 — only probe hybrid stats on the frame we actually
+                // ran hybrid on. one jni call, three longs into a preallocated scratch
+                // buffer — zero per-frame garbage. we snapshot the three values into
+                // local vals immediately so the post-to-ui lambda below doesn't read
+                // the shared scratch buffer (which a later bg frame could be mid-write
+                // on — 64-bit stores aren't guaranteed tear-free on 32-bit arm)
+                val haveHybridStats = currentMode == 3
+                var hybridMidRowSnap = 0
+                var hybridNeonSnap   = 0L
+                var hybridGpuSnap    = 0L
+                if (haveHybridStats) {
+                    activity.nativeGetHybridStats(hybridStatsBuf)
+                    hybridMidRowSnap = hybridStatsBuf[0].toInt()
+                    hybridNeonSnap   = hybridStatsBuf[1]
+                    hybridGpuSnap    = hybridStatsBuf[2]
+                }
+
                 // stage 4: fill pre-allocated rawBmp with edge pixels — no Bitmap allocation
                 val bmpCreateStartNs = System.nanoTime()
                 rawBmp.copyPixelsFromBuffer(ByteBuffer.wrap(edgeBytes))
@@ -421,6 +453,13 @@ fun CameraScreen() {
                     if (modeChanged) transitionCount++
                     if (droppedOnSwitch) droppedDuringTransition++
                     if (isJitter) jitterCount++
+                    // publish the adaptive split telemetry (hybrid only) — using the
+                    // bg-thread snapshot, never the shared scratch buffer
+                    if (haveHybridStats) {
+                        hybridMidRow     = hybridMidRowSnap
+                        hybridNeonHalfNs = hybridNeonSnap
+                        hybridGpuHalfNs  = hybridGpuSnap
+                    }
                 }
             } finally {
                 image.close() // must close every image or camera stalls
@@ -578,8 +617,40 @@ fun CameraScreen() {
                     Text("NEON:   ${fmtNs(neonSobelNs)}", color = Color.Green,       fontSize = 13.sp)
                 if (gpuSobelNs  > 0)
                     Text("GPU:    ${fmtNs(gpuSobelNs)}",  color = Color(0xFFFF9800), fontSize = 13.sp)
-                if (hybridSobelNs > 0)
+                if (hybridSobelNs > 0) {
                     Text("Hybrid: ${fmtNs(hybridSobelNs)}", color = Color.Magenta,   fontSize = 13.sp)
+                    // phase 4 stage 5 — adaptive split readout. only draw once we've
+                    // seen at least one hybrid frame (midRow == 0 is the uninitialised
+                    // state on the kotlin side)
+                    if (hybridMidRow > 0) {
+                        val totalRows = 720  // frame is 1280x720 throughout the pipeline
+                        val neonPct   = (hybridMidRow * 100) / totalRows
+                        val gpuPct    = 100 - neonPct
+                        val bottomRows = totalRows - hybridMidRow
+                        // converged == both halves finish within 10% of each other.
+                        // while we're still adapting, paint it yellow so it's obvious
+                        // the ratio is still moving around
+                        val nH = hybridNeonHalfNs
+                        val gH = hybridGpuHalfNs
+                        val converged = nH > 0 && gH > 0 &&
+                            kotlin.math.abs(nH - gH).toDouble() / kotlin.math.max(nH, gH) < 0.10
+                        Text(
+                            "Split:  ${neonPct}% N / ${gpuPct}% G  (${hybridMidRow}/${bottomRows})",
+                            color = if (converged) Color.Green else Color.Yellow,
+                            fontSize = 12.sp
+                        )
+                        // per-half raw timings — useful when debugging why the split
+                        // refuses to converge (usually: one side is dominated by
+                        // upload/readback instead of actual compute)
+                        if (nH > 0 && gH > 0) {
+                            Text(
+                                "   N ${fmtNs(nH)}  G ${fmtNs(gH)}",
+                                color = Color.LightGray,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
                 // show speedup vs baseline for whichever accelerated modes have run
                 val bestNs = listOfNotNull(
                     if (neonSobelNs   > 0) neonSobelNs   else null,

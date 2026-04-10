@@ -548,6 +548,17 @@ static GLuint g_activeSobelImgProg = 0;  // whichever variant nativeGpuSobel/nat
 static int    g_activeWgX = 16;          // matches the variant above — dispatch needs it to compute group count
 static int    g_activeWgY = 16;
 
+// phase 4 stage 5 — adaptive hybrid split state. midRow is the boundary the next
+// hybrid frame will use; -1 is the cold-start sentinel ("haven't picked one yet,
+// fall back to height/2"). the two EMAs hold smoothed per-row cost for each path
+// so a single noisy frame can't yank the split around. last*HalfNs are just the
+// raw timings from the previous frame, surfaced to the dashboard for debugging.
+static int    g_hybridMidRow   = -1;
+static double g_neonNsPerRow   = 0.0;
+static double g_gpuNsPerRow    = 0.0;
+static long   g_lastNeonHalfNs = 0;
+static long   g_lastGpuHalfNs  = 0;
+
 // helper: compile a single compute shader from GLSL source and link it into a program
 // returns the program id on success, 0 on any error (details logged to logcat)
 static GLuint compileComputeProgram(const char* source) {
@@ -1276,70 +1287,144 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
     uint8_t* inputBuf  = (uint8_t*)env->GetPrimitiveArrayCritical(rgbaInput,   nullptr);
     uint8_t* outputBuf = (uint8_t*)env->GetPrimitiveArrayCritical(outputArray, nullptr);
 
-    int midRow = height / 2;
-
-    // neon top half on a separate thread
-    std::thread neonThread(sobelNeonRows, inputBuf, outputBuf, width, height, 0, midRow);
-
-    // gpu bottom half on this thread (owns the EGL context)
+    // phase 4 stage 5 — pick the split row the EMA decided on last frame.
+    // -1 means "first time we've ever been called for this resolution", fall
+    // back to plain 50/50 so we have a sane starting point to measure from.
+    if (g_hybridMidRow < 0) g_hybridMidRow = height / 2;
+    int midRow      = g_hybridMidRow;
+    int topRows     = midRow;
     int bottomRows  = height - midRow;
     int bottomBytes = bottomRows * width * 4;
+
+    long neonHalfNs = 0;  // filled in by the neon thread (or stays 0 if topRows == 0)
+    long gpuHalfNs  = 0;  // measured around the gpu dispatch + readback below
+
+    // neon top half on a separate thread. the lambda wrapper exists purely so we
+    // can time the actual sobel call without dragging clock_gettime calls into
+    // sobelNeonRows itself (it's shared with non-hybrid paths).
+    std::thread neonThread;
+    if (topRows > 0) {
+        neonThread = std::thread([&]() {
+            struct timespec a, b;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            sobelNeonRows(inputBuf, outputBuf, width, height, 0, topRows);
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            neonHalfNs = (b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec);
+        });
+    }
 
     // phase 4 stage 4 — same texture/ssbo lifecycle as nativeGpuSobel; we upload the
     // FULL frame (not just the bottom half) because the shader needs row midRow-1 as
     // a neighbor when it processes row midRow — cutting the texture at midRow would
     // give a black seam on the split boundary
-    if (g_inputTex == 0 || g_texW != width || g_texH != height) {
-        if (g_inputTex != 0) { glDeleteTextures(1, &g_inputTex); g_inputTex = 0; }
-        glGenTextures(1, &g_inputTex);
+    if (bottomRows > 0) {
+        struct timespec g0, g1;
+        clock_gettime(CLOCK_MONOTONIC, &g0);
+
+        if (g_inputTex == 0 || g_texW != width || g_texH != height) {
+            if (g_inputTex != 0) { glDeleteTextures(1, &g_inputTex); g_inputTex = 0; }
+            glGenTextures(1, &g_inputTex);
+            glBindTexture(GL_TEXTURE_2D, g_inputTex);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width, height);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            g_texW = width; g_texH = height;
+        }
         glBindTexture(GL_TEXTURE_2D, g_inputTex);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width, height);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        g_texW = width; g_texH = height;
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, inputBuf);
+
+        if (g_ssboOut == 0) {
+            glGenBuffers(1, &g_ssboOut);
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
+        if (g_ssboBytes != totalBytes) {
+            glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_DYNAMIC_DRAW);
+            g_ssboBytes = totalBytes;
+        }
+
+        glUseProgram(g_activeSobelImgProg);
+        glBindImageTexture(0, g_inputTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_ssboOut);
+        glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uWidth"),     width);
+        glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uHeight"),    height);
+        glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uRowOffset"), midRow);
+
+        GLuint groupsX = (GLuint)(width      + g_activeWgX - 1) / g_activeWgX;
+        GLuint groupsY = (GLuint)(bottomRows + g_activeWgY - 1) / g_activeWgY;
+        glDispatchCompute(groupsX, groupsY, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
+        // glMapBufferRange blocks until the compute pass is actually done, so the
+        // wall-clock window around it is a valid "how long did the gpu half cost"
+        // measurement — no glFinish needed, which would hurt the fast path.
+        void* gpuData = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, bottomBytes, GL_MAP_READ_BIT);
+        if (gpuData) {
+            memcpy(outputBuf + midRow * width * 4, gpuData, bottomBytes);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        } else {
+            LOGI("nativeHybridSobel: GPU readback failed, bottom half will be black");
+        }
+        // texture + SSBO are persistent — no per-frame cleanup
+
+        clock_gettime(CLOCK_MONOTONIC, &g1);
+        gpuHalfNs = (g1.tv_sec - g0.tv_sec) * 1000000000L + (g1.tv_nsec - g0.tv_nsec);
     }
-    glBindTexture(GL_TEXTURE_2D, g_inputTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, inputBuf);
 
-    if (g_ssboOut == 0) {
-        glGenBuffers(1, &g_ssboOut);
+    if (neonThread.joinable()) neonThread.join();
+
+    // phase 4 stage 5 — feed the two half-timings into an EMA and pick next frame's
+    // split so both halves *predict* to finish at the same time. the intuition is
+    // simple: if neon took 2ms for N rows and gpu took 4ms for M rows, gpu is ~2x
+    // slower per row, so we should hand more rows to neon. algebra: want
+    //   neonCost * top == gpuCost * (H - top)
+    //   top = H * gpuCost / (neonCost + gpuCost)
+    // which is what the frac expression below computes.
+    if (topRows > 0 && neonHalfNs > 0) {
+        double sample = (double)neonHalfNs / topRows;
+        g_neonNsPerRow = g_neonNsPerRow == 0.0 ? sample : g_neonNsPerRow * 0.9 + sample * 0.1;
     }
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
-    if (g_ssboBytes != totalBytes) {
-        glBufferData(GL_SHADER_STORAGE_BUFFER, totalBytes, nullptr, GL_DYNAMIC_DRAW);
-        g_ssboBytes = totalBytes;
+    if (bottomRows > 0 && gpuHalfNs > 0) {
+        double sample = (double)gpuHalfNs / bottomRows;
+        g_gpuNsPerRow = g_gpuNsPerRow == 0.0 ? sample : g_gpuNsPerRow * 0.9 + sample * 0.1;
     }
-
-    glUseProgram(g_activeSobelImgProg);
-    glBindImageTexture(0, g_inputTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_ssboOut);
-    glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uWidth"),     width);
-    glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uHeight"),    height);
-    glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uRowOffset"), midRow);
-
-    GLuint groupsX = (GLuint)(width      + g_activeWgX - 1) / g_activeWgX;
-    GLuint groupsY = (GLuint)(bottomRows + g_activeWgY - 1) / g_activeWgY;
-    glDispatchCompute(groupsX, groupsY, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_ssboOut);
-    void* gpuData = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, bottomBytes, GL_MAP_READ_BIT);
-    if (gpuData) {
-        memcpy(outputBuf + midRow * width * 4, gpuData, bottomBytes);
-        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-    } else {
-        LOGI("nativeHybridSobel: GPU readback failed, bottom half will be black");
+    if (g_neonNsPerRow > 0.0 && g_gpuNsPerRow > 0.0) {
+        double frac = g_gpuNsPerRow / (g_neonNsPerRow + g_gpuNsPerRow);
+        int next = (int)(height * frac + 0.5);
+        // clamp to [10%, 90%] — a single pathological frame (gc pause, thermal
+        // spike, whatever) can otherwise collapse one side to zero rows and it
+        // takes ages for the EMA to crawl back out of that corner
+        int lo = height / 10;
+        int hi = height - lo;
+        if (next < lo) next = lo;
+        if (next > hi) next = hi;
+        g_hybridMidRow = next;
     }
-    // texture + SSBO are persistent — no per-frame cleanup
-
-    neonThread.join();
+    g_lastNeonHalfNs = neonHalfNs;
+    g_lastGpuHalfNs  = gpuHalfNs;
 
     env->ReleasePrimitiveArrayCritical(rgbaInput,   inputBuf,  JNI_ABORT);
     env->ReleasePrimitiveArrayCritical(outputArray, outputBuf, 0);
 
     return outputArray;
+}
+
+// phase 4 stage 5 — dashboard probe. writes {midRow, neonHalfNs, gpuHalfNs} into
+// a caller-owned long[3] so the kotlin side can show the live split ratio and
+// per-half timings. we intentionally take a preallocated buffer instead of
+// returning a fresh array — this runs once per hybrid frame and a NewLongArray
+// per call is exactly the kind of per-frame allocation stage 2 wanted to kill.
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_csproject_MainActivity_nativeGetHybridStats(
+        JNIEnv* env, jobject, jlongArray outBuf) {
+    jlong vals[3] = {
+        (jlong)g_hybridMidRow,
+        (jlong)g_lastNeonHalfNs,
+        (jlong)g_lastGpuHalfNs
+    };
+    env->SetLongArrayRegion(outBuf, 0, 3, vals);
 }
 
 // phase 4 stage 4 — on-device micro-bench for the image2D sobel workgroup variants.
