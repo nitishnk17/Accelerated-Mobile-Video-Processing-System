@@ -21,9 +21,12 @@ import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
+import androidx.compose.ui.draw.clip
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,7 +51,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.material3.Divider
 
 // logcat tag — filter by "CSProject" in android studio
 private const val TAG = "CSProject"
@@ -184,6 +186,9 @@ fun CameraScreen() {
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     // 0=Baseline  1=SIMD  2=GPU  3=Hybrid — cycles on button tap
     var mode            by remember { mutableStateOf(0) }
+    // hud expand/collapse — when false, only the mode + fps header stays on
+    // screen so the camera feed isn't crowded out during a demo
+    var hudExpanded     by remember { mutableStateOf(true) }
     var simdCheckResult by remember { mutableStateOf<String?>(null) }
 
     // track sobel latency per mode for speedup comparison (ns)
@@ -508,200 +513,336 @@ fun CameraScreen() {
             )
         }
 
-        // cycle: Baseline (0) -> SIMD (1) -> GPU (2) -> Hybrid (3) -> Baseline (0)
-        Button(
-            onClick = { mode = (mode + 1) % 4 },
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 24.dp)
-        ) {
-            val (current, next) = when (mode) {
-                0    -> "Baseline" to "SIMD"
-                1    -> "SIMD"     to "GPU"
-                2    -> "GPU"      to "Hybrid"
-                else -> "Hybrid"   to "Baseline"
-            }
-            Text("Active: $current -> Next: $next")
-        }
+        // active mode color drives every accent on screen — the hud's left bar,
+        // the mode header, and whichever segmented pill is currently filled.
+        // one source of truth so a glance tells you which path is live.
+        val accent = modeAccent(mode)
 
-        // semi-transparent hud pinned to top-left corner
-        Column(
+        // top-left hud card. the 3dp accent stripe is a sibling of the metrics
+        // column inside an IntrinsicSize.Min row, so it stretches to whatever
+        // height the content lands at — no drawBehind, no remeasure dance.
+        Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(16.dp)
-                .background(Color.Black.copy(alpha = 0.6f))
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(3.dp)
+                .padding(12.dp)
+                .clip(CardShape)
+                .background(Color.Black.copy(alpha = 0.55f))
+                .height(IntrinsicSize.Min)
         ) {
-            // mode header
-            Text(
-                text = when (mode) { 0 -> "MODE: Baseline"; 1 -> "MODE: SIMD"; 2 -> "MODE: GPU"; else -> "MODE: Hybrid" },
-                color = when (mode) { 0 -> Color.Cyan; 1 -> Color.Green; 2 -> Color(0xFFFF9800); else -> Color.Magenta },
-                fontSize = 13.sp, fontWeight = FontWeight.Bold
-            )
+            Box(Modifier.width(3.dp).fillMaxHeight().background(accent))
 
-            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-
-            //  performance
-            val fpsColor = when {
-                currentFps >= 25.0 -> Color.Green
-                currentFps >= 15.0 -> Color.Yellow
-                else               -> Color.Red
-            }
-            Text("FPS:  ${String.format("%.1f", currentFps)}", color = fpsColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-
-            val intervalDisplay = if (frameIntervalMs < 0L) "--" else "${frameIntervalMs} ms"
-            Text(
-                text  = "Intv: $intervalDisplay",
-                color = if (frameIntervalMs < 0L || frameIntervalMs in 28L..38L) Color.White else Color.Yellow,
-                fontSize = 13.sp
-            )
-
-            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-
-            // phase 4 stage 1 — nanosecond pipeline breakdown
-            Text("YUV:    ${fmtNs(yuvExtractNs)}",  color = Color.White, fontSize = 13.sp)
-            Text("Conv:   ${fmtNs(conversionNs)}",  color = Color.White, fontSize = 13.sp)
-            Text("Sobel:  ${fmtNs(sobelNs)}",       color = Color.Cyan,  fontSize = 13.sp, fontWeight = FontWeight.Bold)
-            Text("BmpMk:  ${fmtNs(bitmapCreateNs)}",color = Color.White, fontSize = 13.sp)
-            Text("BmpRot: ${fmtNs(bitmapRotateNs)}",color = Color.White, fontSize = 13.sp)
-            Text("E2E:    ${fmtNs(endToEndNs)}",    color = Color.Yellow,fontSize = 13.sp, fontWeight = FontWeight.Bold)
-
-            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-
-            // neon verification badge
-            simdCheckResult?.let {
-                val ok = it.startsWith("PASS")
-                Text(
-                    if (ok) "SIMD: PASS " else "SIMD: FAIL ",
-                    color = if (ok) Color.Green else Color.Red,
-                    fontSize = 13.sp, fontWeight = FontWeight.Bold
-                )
-            }
-
-            // phase 3 stage 1 — gpu context + ssbo pass-through verification badge
-            gpuInitResult?.let {
-                val ok = it.startsWith("GPU PASS")
-                Text(
-                    if (ok) "GPU:  PASS " else "GPU:  FAIL ",
-                    color = if (ok) Color.Green else Color.Red,
-                    fontSize = 13.sp, fontWeight = FontWeight.Bold
-                )
-            }
-
-            // gpu sobel correctness badge: only shows up once the check has run
-            gpuSobelCheckResult?.let {
-                val ok = it.startsWith("GPU SOBEL PASS")
-                Text(
-                    if (ok) "GPU Sobel: PASS " else "GPU Sobel: FAIL ",
-                    color = if (ok) Color.Green else Color.Red,
-                    fontSize = 13.sp, fontWeight = FontWeight.Bold
-                )
-            }
-
-            // phase 4 stage 4 — winning workgroup size from the on-device benchmark
-            gpuBenchResult?.let {
-                val winner = it.substringAfterLast("-> ").removeSuffix(" wins")
-                Text(
-                    "GPU WG:   $winner",
-                    color = Color(0xFFFF9800),
-                    fontSize = 13.sp, fontWeight = FontWeight.Bold
-                )
-            }
-
-            // speedup table — shown once at least two modes have been sampled (ns precision)
-            if (baselineSobelNs > 0 && (neonSobelNs > 0 || gpuSobelNs > 0 || hybridSobelNs > 0)) {
-                Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-                Text("Base:   ${fmtNs(baselineSobelNs)}", color = Color.Cyan,       fontSize = 13.sp)
-                if (neonSobelNs > 0)
-                    Text("NEON:   ${fmtNs(neonSobelNs)}", color = Color.Green,       fontSize = 13.sp)
-                if (gpuSobelNs  > 0)
-                    Text("GPU:    ${fmtNs(gpuSobelNs)}",  color = Color(0xFFFF9800), fontSize = 13.sp)
-                if (hybridSobelNs > 0) {
-                    Text("Hybrid: ${fmtNs(hybridSobelNs)}", color = Color.Magenta,   fontSize = 13.sp)
-                    // phase 4 stage 5 — adaptive split readout. only draw once we've
-                    // seen at least one hybrid frame (midRow == 0 is the uninitialised
-                    // state on the kotlin side)
-                    if (hybridMidRow > 0) {
-                        val totalRows = 720  // frame is 1280x720 throughout the pipeline
-                        val neonPct   = (hybridMidRow * 100) / totalRows
-                        val gpuPct    = 100 - neonPct
-                        val bottomRows = totalRows - hybridMidRow
-                        // converged == both halves finish within 10% of each other.
-                        // while we're still adapting, paint it yellow so it's obvious
-                        // the ratio is still moving around
-                        val nH = hybridNeonHalfNs
-                        val gH = hybridGpuHalfNs
-                        val converged = nH > 0 && gH > 0 &&
-                            kotlin.math.abs(nH - gH).toDouble() / kotlin.math.max(nH, gH) < 0.10
+            Column(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                // ── header: mode name + the hero fps number + collapse toggle ──
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(
+                        text = modeName(mode),
+                        color = accent,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.width(14.dp))
+                    val fpsColor = when {
+                        currentFps >= 25.0 -> Color.Green
+                        currentFps >= 15.0 -> Color.Yellow
+                        else               -> Color.Red
+                    }
+                    Text(
+                        text = String.format("%.0f", currentFps),
+                        color = fpsColor,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(" fps", color = LabelGray, fontSize = 10.sp)
+                    Spacer(Modifier.width(12.dp))
+                    // tiny chevron toggle — ▾ when expanded, ▸ when collapsed.
+                    // big invisible padding makes the tap target finger-friendly
+                    // even though the glyph itself is small
+                    Box(
+                        modifier = Modifier
+                            .clickable { hudExpanded = !hudExpanded }
+                            .padding(horizontal = 6.dp, vertical = 4.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
                         Text(
-                            "Split:  ${neonPct}% N / ${gpuPct}% G  (${hybridMidRow}/${bottomRows})",
-                            color = if (converged) Color.Green else Color.Yellow,
-                            fontSize = 12.sp
+                            text = if (hudExpanded) "▾" else "▸",
+                            color = LabelGray,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
                         )
-                        // per-half raw timings — useful when debugging why the split
-                        // refuses to converge (usually: one side is dominated by
-                        // upload/readback instead of actual compute)
-                        if (nH > 0 && gH > 0) {
-                            Text(
-                                "   N ${fmtNs(nH)}  G ${fmtNs(gH)}",
-                                color = Color.LightGray,
-                                fontSize = 12.sp
-                            )
+                    }
+                }
+
+                if (hudExpanded) {
+
+                // sub-header — e2e latency (the other hero) and frame interval.
+                // interval goes yellow if it drifts outside the 28..38 ms window
+                // around 30 fps, which usually means a dropped/late frame.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("E2E ", color = LabelGray, fontSize = 11.sp)
+                    Text(
+                        fmtNs(endToEndNs),
+                        color = Color.Yellow,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    val intvOk = frameIntervalMs < 0L || frameIntervalMs in 28L..38L
+                    Text(
+                        text = "Δ " + if (frameIntervalMs < 0L) "--" else "${frameIntervalMs}ms",
+                        color = if (intvOk) LabelGray else Color.Yellow,
+                        fontSize = 11.sp
+                    )
+                }
+
+                // ── PIPELINE — phase 4 stage 1 ns breakdown, two compact columns ──
+                SectionHeader("PIPELINE")
+                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        MetricRow("YUV",  fmtNs(yuvExtractNs))
+                        MetricRow("Conv", fmtNs(conversionNs))
+                        MetricRow("Sobel", fmtNs(sobelNs), Color.Cyan, bold = true)
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        MetricRow("BmpMk", fmtNs(bitmapCreateNs))
+                        MetricRow("Rot",   fmtNs(bitmapRotateNs))
+                    }
+                }
+
+                // ── SPEEDUP — only meaningful once at least one accelerated mode has run ──
+                if (baselineSobelNs > 0 && (neonSobelNs > 0 || gpuSobelNs > 0 || hybridSobelNs > 0)) {
+                    SectionHeader("SPEEDUP")
+                    MetricRow("Base", fmtNs(baselineSobelNs), Color.Cyan)
+                    if (neonSobelNs > 0)
+                        MetricRow("NEON", fmtNs(neonSobelNs), Color.Green)
+                    if (gpuSobelNs > 0)
+                        MetricRow("GPU ", fmtNs(gpuSobelNs), GpuOrange)
+                    if (hybridSobelNs > 0) {
+                        MetricRow("Hyb ", fmtNs(hybridSobelNs), Color.Magenta)
+                        // phase 4 stage 5 — adaptive split readout. midRow == 0 is the
+                        // "haven't seen a hybrid frame yet" sentinel, so we gate on it.
+                        // green once both halves finish within 10% of each other,
+                        // yellow while the controller is still chasing the balance.
+                        if (hybridMidRow > 0) {
+                            val neonPct = (hybridMidRow * 100) / 720
+                            val nH = hybridNeonHalfNs
+                            val gH = hybridGpuHalfNs
+                            val converged = nH > 0 && gH > 0 &&
+                                kotlin.math.abs(nH - gH).toDouble() / kotlin.math.max(nH, gH) < 0.10
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("     split ", color = LabelGray, fontSize = 10.sp)
+                                Text(
+                                    "${neonPct}/${100 - neonPct}",
+                                    color = if (converged) Color.Green else Color.Yellow,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (nH > 0 && gH > 0) {
+                                    // per-half raw timings — when the split refuses to converge
+                                    // it's almost always because one side is upload/readback
+                                    // bound, not actual compute, and you'll see it here first
+                                    Text("  N ", color = LabelGray, fontSize = 10.sp)
+                                    Text(fmtNs(nH), color = Color.LightGray, fontSize = 10.sp)
+                                    Text("  G ", color = LabelGray, fontSize = 10.sp)
+                                    Text(fmtNs(gH), color = Color.LightGray, fontSize = 10.sp)
+                                }
+                            }
+                        }
+                    }
+                    val bestNs = listOfNotNull(
+                        if (neonSobelNs   > 0) neonSobelNs   else null,
+                        if (gpuSobelNs    > 0) gpuSobelNs    else null,
+                        if (hybridSobelNs > 0) hybridSobelNs else null
+                    ).min()
+                    val ratio = baselineSobelNs.toDouble() / bestNs.toDouble()
+                    Text(
+                        text = "${String.format("%.1f", ratio)}× vs baseline",
+                        color = Color.Yellow,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 1.dp)
+                    )
+                }
+
+                // ── SYSTEM — cpu / temp on one row, reliability counters on the next ──
+                SectionHeader("SYSTEM")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    MetricRow("CPU", "${String.format("%.0f", cpuUsagePercent)}%")
+                    Spacer(Modifier.width(10.dp))
+                    val tempColor = when {
+                        thermalTempC < 0    -> Color.White
+                        thermalTempC < 40.0 -> Color.Green   // cool
+                        thermalTempC < 45.0 -> Color.Yellow  // warm
+                        else                -> Color.Red     // throttling territory
+                    }
+                    MetricRow(
+                        "Temp",
+                        if (thermalTempC < 0) "--" else "${String.format("%.1f", thermalTempC)}°C",
+                        tempColor
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    MetricRow(
+                        "Jit", "$jitterCount",
+                        if (jitterCount < 10) Color.Green else Color.Yellow,
+                        bold = true
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    MetricRow("Sw", "$transitionCount")
+                    Spacer(Modifier.width(10.dp))
+                    MetricRow(
+                        "Drop", "$droppedDuringTransition",
+                        if (droppedDuringTransition == 0) Color.Green else Color.Red,
+                        bold = true
+                    )
+                }
+
+                // ── VERIFY — pills only render once each underlying check has reported,
+                //    so cold-start doesn't show empty placeholders ──
+                val anyVerify = simdCheckResult != null || gpuInitResult != null ||
+                                gpuSobelCheckResult != null || gpuBenchResult != null
+                if (anyVerify) {
+                    SectionHeader("VERIFY")
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        simdCheckResult?.let { StatusPill("NEON", it.startsWith("PASS")) }
+                        gpuInitResult?.let   { StatusPill("GPU",  it.startsWith("GPU PASS")) }
+                        gpuSobelCheckResult?.let { StatusPill("SOB", it.startsWith("GPU SOBEL PASS")) }
+                        gpuBenchResult?.let {
+                            // phase 4 stage 4 winner — small orange chip in the same row
+                            val winner = it.substringAfterLast("-> ").removeSuffix(" wins")
+                            Box(
+                                modifier = Modifier
+                                    .background(GpuOrange.copy(alpha = 0.85f), BadgeShape)
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text("WG $winner", color = Color.Black, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }
-                // show speedup vs baseline for whichever accelerated modes have run
-                val bestNs = listOfNotNull(
-                    if (neonSobelNs   > 0) neonSobelNs   else null,
-                    if (gpuSobelNs    > 0) gpuSobelNs    else null,
-                    if (hybridSobelNs > 0) hybridSobelNs else null
-                ).min()
-                val ratio = baselineSobelNs.toDouble() / bestNs.toDouble()
-                Text(
-                    text = "Speedup: ${String.format("%.1f", ratio)}×",
-                    color = Color.Yellow,
-                    fontSize = 13.sp, fontWeight = FontWeight.Bold
-                )
+
+                } // end of if (hudExpanded)
             }
+        }
 
-            Divider(color = Color.Gray.copy(alpha = 0.5f), thickness = 0.5.dp)
-
-            // system
-            Text("CPU:  ${String.format("%.1f", cpuUsagePercent)}%", color = Color.White, fontSize = 13.sp)
-
-            // goes yellow/red as the soc heats up — red usually means throttling
-            val tempDisplay = if (thermalTempC < 0) "--" else "${String.format("%.1f", thermalTempC)}°C"
-            Text(
-                text = "Temp: $tempDisplay",
-                color = when {
-                    thermalTempC < 0    -> Color.White
-                    thermalTempC < 40.0 -> Color.Green
-                    thermalTempC < 45.0 -> Color.Yellow
-                    else                -> Color.Red
-                },
-                fontSize = 13.sp
-            )
-
-            // stress-test counters — tap the mode button rapidly and watch these
-            Text("Switches: $transitionCount", color = Color.White, fontSize = 13.sp)
-            Text(
-                text = "Drop@Switch: $droppedDuringTransition",
-                color = if (droppedDuringTransition == 0) Color.Green else Color.Red,
-                fontSize = 13.sp, fontWeight = FontWeight.Bold
-            )
-
-            Text(
-                text = "Jitter: $jitterCount",
-                color = if (jitterCount < 10) Color.Green else Color.Yellow,
-                fontSize = 13.sp, fontWeight = FontWeight.Bold
-            )
+        // segmented mode switcher pinned to bottom-center. one tap per mode
+        // beats the old cycle button — and stress-tap testing still works,
+        // just mash any pill and watch Switches climb.
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 28.dp)
+                .clip(PillShape)
+                .background(Color.Black.copy(alpha = 0.6f))
+        ) {
+            ModePill("Base", 0, mode) { mode = 0 }
+            ModePill("SIMD", 1, mode) { mode = 1 }
+            ModePill("GPU",  2, mode) { mode = 2 }
+            ModePill("Hyb",  3, mode) { mode = 3 }
         }
     }
 }
 
 // phase 4 stage 1 — formats a nanosecond duration as milliseconds (2 decimal places)
 fun fmtNs(ns: Long): String = "${String.format("%.2f", ns / 1_000_000.0)} ms"
+
+// hoisted shapes/colors for the dashboard. top-level vals so the hud (which
+// recomposes ~30x/s) doesn't re-allocate a fresh Shape or Color every frame.
+private val CardShape  = RoundedCornerShape(10.dp)
+private val PillShape  = RoundedCornerShape(20.dp)
+private val BadgeShape = RoundedCornerShape(4.dp)
+private val LabelGray  = Color(0xFFB0B0B0)   // metric labels (slightly brighter)
+private val DimGray    = Color(0xFF9E9E9E)   // section header dimmer
+private val GpuOrange  = Color(0xFFFF9800)
+private val PassGreen  = Color(0xFF1B5E20)
+private val FailRed    = Color(0xFFB71C1C)
+
+private fun modeAccent(mode: Int): Color = when (mode) {
+    0    -> Color.Cyan
+    1    -> Color.Green
+    2    -> GpuOrange
+    else -> Color.Magenta
+}
+
+private fun modeName(mode: Int): String = when (mode) {
+    0    -> "BASELINE"
+    1    -> "SIMD"
+    2    -> "GPU"
+    else -> "HYBRID"
+}
+
+// tiny uppercase divider — replaces the bare 0.5dp lines from the old hud.
+// inputs are stable so compose smart-skips this whenever the label is unchanged
+@Composable
+private fun SectionHeader(text: String) {
+    Text(
+        text       = text,
+        color      = DimGray,
+        fontSize   = 9.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 1.sp,
+        modifier   = Modifier.padding(top = 4.dp)
+    )
+}
+
+// label + value on one row. all params are stable types so compose can skip
+// rows whose value string didn't change this frame — only the few metrics
+// that actually move (FPS, Sobel, E2E…) re-execute, the rest stay cached
+@Composable
+private fun MetricRow(
+    label: String,
+    value: String,
+    valueColor: Color = Color.White,
+    bold: Boolean = false
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = LabelGray, fontSize = 11.sp)
+        Spacer(Modifier.width(4.dp))
+        Text(
+            text = value,
+            color = valueColor,
+            fontSize = 12.sp,
+            fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal
+        )
+    }
+}
+
+// little colored chip for the VERIFY block. green = check passed, red = check failed
+@Composable
+private fun StatusPill(label: String, ok: Boolean) {
+    Box(
+        modifier = Modifier
+            .background((if (ok) PassGreen else FailRed).copy(alpha = 0.85f), BadgeShape)
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+    ) {
+        Text(label, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+// one cell of the segmented mode switcher. the active pill fills with the
+// mode's accent color, the others stay transparent on top of the row's
+// shared dark background — that one shared bg is what gives the segmented
+// look without us having to draw any borders between cells
+@Composable
+private fun ModePill(label: String, idx: Int, active: Int, onClick: () -> Unit) {
+    val isActive = idx == active
+    Box(
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .background(if (isActive) modeAccent(idx).copy(alpha = 0.85f) else Color.Transparent)
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text       = label,
+            color      = if (isActive) Color.Black else Color.White.copy(alpha = 0.75f),
+            fontSize   = 12.sp,
+            fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
+        )
+    }
+}
 
 // reads /proc/stat twice 500 ms apart and returns cpu busy percentage
 suspend fun measureCpuUsage(): Double {
