@@ -1,0 +1,447 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{xcolor}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue,
+    citecolor=black
+}
+
+\setstretch{1.2}
+\setlist[itemize]{noitemsep, topsep=4pt}
+\setlist[enumerate]{noitemsep, topsep=4pt}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\title{\textbf{Accelerated Mobile Video Processing System}\\[4pt]
+\large Real-Time Camera Pipeline Using CPU SIMD and Mobile GPU}
+
+\author{
+Nitish Kumar \and Salil Gujar
+}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+In this project, we built a real-time Android application that captures live camera frames, processes them on the device, and displays the transformed output continuously on screen. The main goal of the work was not just to make a working camera app, but to study how mobile hardware acceleration can improve a continuous image-processing workload. We selected Sobel edge detection as the processing task because it is mathematically clear, works on every frame, depends on local pixel neighborhoods, and has a well-defined notion of correctness.
+
+Our system supports four execution modes: a scalar CPU baseline, a SIMD-accelerated CPU path using ARM NEON, a GPU-accelerated path using OpenGL ES compute shaders, and a hybrid mode that uses both CPU SIMD and GPU together. We also built a live performance dashboard so that the behavior of the system remains visible during execution. The dashboard shows the current mode, frame rate, processing latency, end-to-end latency, hardware activity status, and thermal proxy information.
+
+The work was done as a two-person systems project. Our approach was incremental. We first established a correct and measurable baseline, then accelerated it step by step, and finally focused on runtime stability, switching behavior, and measurement quality. The current application runs on a physical Android phone, works fully offline, supports runtime mode switching, and demonstrates clear improvement over the scalar baseline. This report explains the problem statement from the assignment, the design choices we made, what we have actually implemented, the main engineering challenges we faced, and how the final system matches the required end-to-end mobile processing pipeline.
+\end{abstract}
+
+\section{Introduction}
+
+Modern mobile phones have multiple computing resources available at the same time. A phone is not just a simple CPU-based system anymore. It includes scalar CPU execution, vector execution through SIMD instructions, and a mobile GPU that can perform large amounts of parallel work. In theory, this hardware should allow real-time workloads to run much faster. In practice, however, acceleration on mobile devices is not automatic. It requires careful system design, attention to data movement, correct synchronization, and a clear way to measure whether the acceleration is actually useful.
+
+Our project studies this problem in the context of live camera video processing. The system captures frames from the rear camera, applies Sobel edge detection to every frame, and renders the processed output in real time. We intentionally chose a live camera pipeline rather than an offline image-processing task because the assignment emphasizes end-to-end systems work. The final result must continuously capture, process, and display frames on the device without user intervention, without external computation, and without restarting when switching between execution modes.
+
+We approached the project as a performance engineering task. A visually correct output was necessary, but it was not enough. The more important question was how to demonstrate measurable acceleration clearly and honestly. Because of that, we treated the baseline implementation as a reference system and built all optimized modes around it. We also added live measurement tools directly into the app so that an observer can understand what the hardware is doing while the system is running.
+
+\section{Problem Statement}
+
+The problem statement of the project can be expressed in a simple way:
+
+\begin{quote}
+Design and build an Android application that takes live camera frames, processes them continuously on the device, and demonstrates measurable performance improvement using CPU SIMD, mobile GPU execution, and a hybrid combination of both.
+\end{quote}
+
+The assignment also places clear conditions on the system:
+
+\begin{itemize}
+\item The application must work as a live camera pipeline.
+\item Processing must happen on every frame.
+\item The output must be shown on screen in real time.
+\item The work must happen fully on the mobile device.
+\item The application must support multiple execution modes at runtime.
+\item The outputs of the different modes must remain functionally equivalent within acceptable tolerance.
+\item The performance improvement over baseline must be visible and measurable.
+\item A live dashboard is a mandatory part of the final system.
+\end{itemize}
+
+This means the project is not only about writing a faster filter. It is about building a complete end-to-end system where correctness, speed, responsiveness, and observability all matter together.
+
+\subsection{What the Assignment Specifically Expects}
+
+After reading the assignment document carefully, we understood that the final system must satisfy five central ideas:
+
+\begin{enumerate}
+\item It must be a \textbf{live camera pipeline}, not an offline image-processing demo.
+\item It must support \textbf{four execution modes}: baseline, SIMD, GPU, and hybrid.
+\item It must show \textbf{measurable acceleration relative to baseline}.
+\item It must include a \textbf{real-time dashboard} that is visible while the app is running.
+\item It must run \textbf{stably on a physical Android phone} without manual intervention during normal use.
+\end{enumerate}
+
+We kept these five points in mind throughout the project. They shaped not only the implementation but also the way we measured and cleaned up the final system.
+
+\section{Why We Chose Sobel Edge Detection}
+
+We chose Sobel edge detection because it is a good match for the assignment and for the hardware-acceleration study we wanted to perform.
+
+First, Sobel is a local neighborhood operation. Each output pixel depends on a small three-by-three neighborhood around the input pixel. This makes it computationally meaningful and more interesting than a trivial per-pixel color operation.
+
+Second, Sobel has a clear correctness reference. If we know the input pixels, then the expected output can be calculated directly. This is important because once we start using SIMD and GPU execution, we need a reliable way to compare accelerated outputs against the scalar baseline.
+
+Third, Sobel is heavy enough to show the difference between processing approaches. A simple transformation might not reveal much about acceleration, but Sobel includes repeated neighborhood access, weighted accumulation, and per-pixel output generation across the full frame.
+
+Finally, the visual output of Sobel is easy to inspect. It highlights edges in the camera scene, so if something goes wrong, the error often becomes visible immediately. This helped us during development and debugging.
+
+\section{Overall System Approach}
+
+We followed a layered and incremental approach rather than trying to implement everything at once. As a group of two people, this was important because it allowed us to divide the work into understandable stages and verify each stage before moving ahead.
+
+Our approach had the following major ideas:
+
+\begin{enumerate}
+\item Build a working scalar baseline first.
+\item Keep the baseline as the correctness reference for all future modes.
+\item Add acceleration one layer at a time: SIMD first, then GPU, then hybrid.
+\item Keep the system observable at every stage through a dashboard.
+\item Measure the real end-to-end behavior of the app, not just isolated kernels.
+\item Fix runtime issues such as switching stability, resource cleanup, and misleading measurements as part of the final system design.
+\end{enumerate}
+
+This approach helped us avoid a common problem in acceleration projects, where optimization happens too early and makes the system difficult to reason about. Instead, we kept asking two questions at every stage:
+
+\begin{itemize}
+\item Is the output still correct?
+\item Is the acceleration actually useful in the complete live pipeline?
+\end{itemize}
+
+\section{System Architecture}
+
+At a high level, the architecture of our application is:
+
+\begin{center}
+Live Camera Input $\rightarrow$ Native Frame Processing $\rightarrow$ Display Output $\rightarrow$ Live Dashboard
+\end{center}
+
+The camera subsystem captures frames using the Android Camera2 API. These frames arrive in YUV format through an \texttt{ImageReader}. The image-processing work is performed in native C++ through JNI, because that is where we need direct access to NEON intrinsics and GPU compute setup. The processed data is then converted into a displayable bitmap and shown on screen in the Android UI. On top of the camera output, we render a compact dashboard that presents the current performance state of the system.
+
+The application currently supports:
+
+\begin{itemize}
+\item Baseline mode
+\item SIMD mode
+\item GPU mode
+\item Hybrid mode
+\item Runtime switching between modes
+\item Runtime switching between 720p and 1080p processing
+\item A live dashboard with system and acceleration indicators
+\end{itemize}
+
+Although the UI is visible, we did not treat the project as a UI design exercise. The UI is present only to support continuous display and live measurement. The main engineering work is in the camera pipeline, native processing, hardware acceleration, and runtime stability.
+
+\section{How Our Current Work Matches the Assignment}
+
+At this stage, our implementation matches the assignment in the following direct way:
+
+\begin{itemize}
+\item \textbf{Live camera input:} the app captures frames continuously from the rear camera on a physical Android phone.
+\item \textbf{On-device processing:} all processing is done locally on the phone using native C++ and OpenGL ES compute shaders.
+\item \textbf{Continuous display:} processed frames are shown live on screen without offline pre-processing.
+\item \textbf{Multiple modes:} baseline, SIMD, GPU, and hybrid modes are all available in the same application.
+\item \textbf{Runtime switching:} the user can switch modes while the app is running without restarting the app.
+\item \textbf{Dashboard:} the app shows mode, FPS, processing latency, end-to-end latency, SIMD activity, GPU activity, and thermal proxy information.
+\item \textbf{Correctness checking:} SIMD and GPU outputs are verified against the scalar baseline within acceptable tolerance.
+\item \textbf{Visible performance gain:} the accelerated modes are visibly faster than baseline, especially at 720p and also clearly at 1080p compared to the scalar path.
+\end{itemize}
+
+So the app is not only conceptually aligned with the assignment. It already implements the core execution model that the assignment asks for.
+
+\section{Phase 1: Building the Baseline Camera Pipeline}
+
+\subsection{Project Setup}
+
+We began by creating the Android project and enabling native C++ integration through the NDK and JNI. This was necessary because the accelerated parts of the assignment require direct access to lower-level hardware-oriented programming techniques that are not available through normal Kotlin code alone.
+
+The first goal was simply to confirm that the Android application, the native toolchain, and the Kotlin-to-C++ bridge were working correctly. Once that base layer was established, we moved to the camera side.
+
+\subsection{Camera Input and Frame Flow}
+
+We used the rear camera through the Camera2 API and configured a continuous preview pipeline. The camera delivers frames in YUV\_420\_888 format. These frames are received on a background thread through an \texttt{ImageReader}. Using a background thread is important because camera callbacks and processing work should not block the Android UI thread.
+
+At this stage, our goal was not acceleration. The goal was to get a stable and continuous frame flow from the camera to our processing logic and then to the screen.
+
+\subsection{YUV to RGBA Conversion}
+
+The camera does not directly provide the processed frames in a format that can be used easily by our edge detector or by the display layer. Therefore, we implemented a native YUV-to-RGBA conversion step. This conversion reads the Y, U, and V planes carefully using their real memory layout information, including row stride and pixel stride.
+
+This part was important for two reasons. First, it made the pixel data usable for the rest of the pipeline. Second, it gave us an initial place to measure cost inside the frame-processing path.
+
+\subsection{Scalar Baseline Sobel Filter}
+
+Once the frame format was ready, we implemented the scalar CPU version of Sobel edge detection. This baseline version processes each frame using ordinary nested loops and applies the Sobel operator on every pixel. Border handling is done carefully so that the filter remains valid on the edges of the image as well.
+
+This scalar implementation became the ground-truth reference for the entire project. Every later optimization was compared against it for correctness. This was one of the most important design choices we made, because without a trusted reference the accelerated outputs would be difficult to validate.
+
+\subsection{Displaying the Output}
+
+After processing, we rotate and present the result on screen. Since the phone is held in portrait orientation while the camera frame is naturally landscape, we needed a display path that keeps the output visually correct for live viewing. The goal was not only to confirm that the filter works, but to make sure that the whole system satisfies the end-to-end requirement:
+
+\begin{center}
+capture $\rightarrow$ process $\rightarrow$ display
+\end{center}
+
+\subsection{Initial Dashboard}
+
+We added a basic live dashboard as soon as the baseline mode was working. This was done early on purpose. We did not want the dashboard to be an afterthought. Since the assignment explicitly treats the dashboard as a core deliverable, we wanted it to grow together with the system rather than being attached at the end.
+
+At the baseline stage, the dashboard started with mode information, frame rate, and latency readings. Later, we expanded it as the acceleration modes became available.
+
+\section{Phase 2: SIMD Acceleration on the CPU}
+
+\subsection{Why SIMD Was the Next Step}
+
+After building the baseline, the most natural next step was CPU SIMD acceleration. This kept the work on the CPU side, avoided the complexity of GPU setup in the early stages, and allowed us to validate the idea of hardware-aware acceleration using a controlled method.
+
+On our target devices, the relevant SIMD instruction set is ARM NEON. NEON works with vector registers, which means that instead of processing one small pixel value at a time, we can process many values in parallel.
+
+\subsection{Warm-Up with a Simpler SIMD Operation}
+
+Before applying SIMD to the Sobel filter directly, we first wrote and tested a simpler NEON-based operation. This allowed us to confirm that the build configuration was correct, the intrinsics were working, and our understanding of data layout was sound.
+
+This warm-up stage was useful because Sobel is more complex than a basic per-pixel operation. By starting simpler, we reduced the chance of making difficult-to-debug mistakes later.
+
+\subsection{NEON Sobel Design}
+
+For the actual SIMD Sobel filter, we designed the loop so that it processes sixteen pixel positions at a time for each channel group. The reason is hardware-based: NEON uses 128-bit vector registers, and for 8-bit values this maps naturally to sixteen lanes per vector. So the design choice was not arbitrary. It follows directly from the vector width of the architecture.
+
+The optimized SIMD path reorganizes the neighborhood operations in a vector-friendly way, computes the horizontal and vertical gradients, and writes back the result in the same general format as the baseline. Any remainder at the edges is handled carefully to keep the full image correct.
+
+\subsection{Correctness Verification for SIMD}
+
+We did not enable SIMD mode based only on speed. We also implemented correctness verification relative to the baseline. The app compares the SIMD output against the scalar reference and checks whether the difference stays within a very small tolerance. This matters because small arithmetic differences can appear when integer vector operations are used, but the output must still remain functionally equivalent.
+
+This step gave us confidence that the speedup was real and not coming from a broken or simplified implementation.
+
+\subsection{What SIMD Gave Us}
+
+The SIMD mode reduced the cost of the Sobel stage significantly compared to the scalar baseline. More importantly, it demonstrated that the app was now able to exploit CPU vector hardware in a visible and measurable way. This was the first point at which the app began to satisfy the assignment's acceleration requirement in a meaningful form.
+
+From our current phone runs, SIMD is the strongest mode in terms of pure Sobel latency. At 720p, baseline Sobel is roughly in the high-thirty millisecond range while SIMD Sobel is around five milliseconds. At 1080p, baseline Sobel goes above eighty milliseconds while SIMD remains around ten milliseconds. This is a very clear and visible acceleration over scalar execution.
+
+\section{Phase 3: GPU Acceleration}
+
+\subsection{Why GPU Acceleration Was Harder}
+
+GPU acceleration was more complex than SIMD for several reasons. Unlike the NEON path, which remains inside the CPU and main memory domain, the GPU path introduces a new execution device, a separate programming model, and explicit synchronization concerns. It is not enough to write a shader and assume that it will be faster. Data must be uploaded, compute work must be dispatched, the result must be made visible, and if the result needs to return to the CPU side then readback cost also becomes important.
+
+This means that GPU acceleration in a real-time mobile pipeline is a system design problem, not only a kernel-writing problem.
+
+\subsection{Headless Compute Context}
+
+To support GPU processing, we created a headless OpenGL ES compute environment through EGL. This allows compute shaders to run without requiring a traditional on-screen graphics pipeline. This was important because our use case is compute-oriented, not a standard 3D rendering problem.
+
+We verified the setup with a simple pass-through operation before trusting it for Sobel. This was similar in spirit to our SIMD warm-up: verify the mechanism first, then move to the real workload.
+
+\subsection{GPU Sobel Design}
+
+The GPU Sobel path uses a compute shader where each invocation is responsible for one output pixel. The shader reads the local neighborhood, computes the Sobel response, and writes the result into GPU-managed output storage. Over time, we improved this path by moving the input to a texture-based read path, because image-oriented access patterns benefit from texture cache behavior more than a purely linear storage-buffer access pattern.
+
+We also benchmarked multiple workgroup configurations so that the active GPU variant is selected based on measured behavior on the device rather than fixed assumptions.
+
+\subsection{Correctness Verification for GPU}
+
+Like the SIMD path, the GPU path is compared against the scalar baseline. Here the numerical tolerance is slightly larger, because GPU execution can involve small floating-point or representation differences depending on the exact data path and shader implementation. Even then, the output must remain functionally equivalent.
+
+\subsection{What We Learned About GPU Performance}
+
+One important lesson from this phase was that GPU acceleration is not automatically better than SIMD. For a relatively local filter like Sobel, the compute work may be fast, but the total pipeline cost can still be affected by texture upload, dispatch overhead, synchronization, and readback. This is why we later optimized the GPU path further by reducing immediate same-frame readback stalls through a pipelined output approach.
+
+This helped us understand the difference between a theoretically parallel kernel and a practically efficient mobile pipeline.
+
+Our current results show that GPU mode is clearly better than baseline, but it is still not always better than SIMD. This is an honest and important result. It shows that the assignment is really about systems engineering and measured acceleration, not about assuming that the GPU must always win.
+
+\section{Phase 4: Hybrid CPU-GPU Execution}
+
+\subsection{Why Hybrid Mode Matters}
+
+The assignment requires not only separate SIMD and GPU modes, but also a coordinated hybrid mode. We treated this as an opportunity to show real heterogeneous computing rather than merely multiple isolated implementations.
+
+The idea of hybrid mode is simple: instead of giving the whole frame to one device, split the work across CPU SIMD and GPU so that both hardware resources contribute to the same frame.
+
+\subsection{Hybrid Split Strategy}
+
+Our hybrid design splits the frame horizontally. One part is processed by the SIMD path and the other part is processed by the GPU path. Once both halves are finished, the outputs are combined into the final displayed image.
+
+At first, a static split is the simplest choice, but we improved the design by making the split adaptive. The app observes how long the CPU half and GPU half take, estimates their per-row cost, and updates the next split so that both sides are more likely to finish around the same time.
+
+This adaptive strategy is important because the CPU and GPU do not necessarily scale in the same way, and the faster side should be assigned more work if the system is to use both resources well.
+
+\subsection{Why Hybrid Mode Is Useful}
+
+Hybrid mode is useful for two reasons. First, it satisfies the assignment's requirement for coordinated heterogeneous execution. Second, it demonstrates a systems-level idea: performance is not only about making a single path faster, but also about balancing work across multiple devices.
+
+In our current app, hybrid mode works correctly and both resources become active at the same time. We also expose the split ratio on the dashboard so that the contribution of each side remains visible during runtime, which matches the assignment's emphasis on resource-aware observability.
+
+\section{Runtime Switching and Stability Work}
+
+\subsection{Need for Reliable Runtime Switching}
+
+The assignment requires switching between modes at runtime without restarting the application. This sounds simple at the UI level, but in practice it affects the camera pipeline, the native processing path, and the GPU resource lifecycle.
+
+During development, we found that careless runtime switching could create stale callbacks, old frame readers, or camera-session races. These problems become even more visible when the app also supports resolution changes.
+
+\subsection{How We Stabilized Switching}
+
+We improved runtime behavior in several ways:
+
+\begin{itemize}
+\item We tied camera restart behavior to real resolution changes and surface availability rather than ordinary UI recomposition.
+\item We added protection against stale camera open and session callbacks.
+\item We dropped old frames during resolution changes so that ghost frames from a previous resolution do not pollute the pipeline.
+\item We reset measurement state when a resolution change occurs so that old and new frame sizes are not mixed in the same statistics.
+\end{itemize}
+
+These changes were important because a fast app that hangs or becomes inconsistent when switching modes would not satisfy the end-to-end system requirement.
+
+\section{Performance Dashboard Design}
+
+\subsection{Why the Dashboard Is Central}
+
+The assignment clearly states that the dashboard is a mandatory deliverable. We treated it as a live explanation layer for the system. The purpose of the dashboard is not decoration. It exists so that anyone watching the app can understand what is currently running and how the hardware resources are being used.
+
+\subsection{What the Dashboard Shows}
+
+The current dashboard includes the following kinds of information:
+
+\begin{itemize}
+\item Current execution mode
+\item Live frame rate
+\item End-to-end latency
+\item Sobel processing latency
+\item SIMD activity state
+\item GPU activity state
+\item Thermal proxy
+\item Jitter count
+\item Speedup over baseline
+\item Hybrid split ratio when hybrid mode is active
+\end{itemize}
+
+We intentionally simplified the dashboard by removing several low-level debug details that were useful during development but not necessary for the final demonstration. This made the dashboard closer to the assignment requirement and easier to understand during a live demo.
+
+This final dashboard design is important for assignment alignment. The assignment does not ask for every internal micro-timing to be shown. It asks for a dashboard that helps the observer understand mode, latency, FPS, and how computation is mapped to SIMD and GPU resources. That is the version we now keep visible in the app.
+
+\subsection{Fixing Misleading Speedup Behavior}
+
+One subtle problem we discovered was that speedup can become misleading if it is computed from unstable frame samples. For example, if the system stores one old SIMD measurement and then keeps updating baseline every frame after switching back, the ratio fluctuates in a way that is mathematically valid but not fair as a comparison.
+
+To fix this, we changed the speedup logic so that it uses stabilized per-mode averages rather than single-frame snapshots. We also ignore a few warm-up frames after switching modes and reset the averages when resolution changes. This makes the reported speedup more meaningful as a performance comparison.
+
+\section{Main Engineering Challenges We Faced}
+
+This project looked simple from far away, but in practice it involved several non-trivial engineering challenges.
+
+\subsection{Challenge 1: Keeping the Whole Pipeline Real-Time}
+
+It is possible to optimize one stage while ignoring the rest of the pipeline, but that would not satisfy the assignment. We had to keep asking whether the app was behaving well as a complete end-to-end system rather than just whether one kernel became faster.
+
+\subsection{Challenge 2: Correctness Across Modes}
+
+Every accelerated mode must remain equivalent to baseline. This required careful comparison logic and discipline in treating the scalar path as the source of truth.
+
+\subsection{Challenge 3: GPU Overhead}
+
+The GPU path was not just about shader speed. Transfer and synchronization overhead mattered a lot. This taught us that acceleration must be evaluated in system context, not in isolation.
+
+\subsection{Challenge 4: Mode and Resolution Switching}
+
+Runtime switching exposed lifecycle issues that would not appear in a static pipeline. We had to fix stale resource reuse, synchronization races, and measurement contamination across different resolutions.
+
+\subsection{Challenge 5: Measurement Quality}
+
+Performance numbers can easily become noisy or misleading. A major part of our effort went into making the measurements honest enough to support real comparison.
+
+\section{Current State of the System}
+
+At the current stage, the application has the main features expected from the assignment:
+
+\begin{itemize}
+\item Real-time camera input on a physical Android device
+\item Continuous on-device frame processing
+\item Live visual output
+\item Scalar baseline mode
+\item SIMD-accelerated mode
+\item GPU-accelerated mode
+\item Hybrid mode
+\item Runtime mode switching
+\item Runtime resolution switching
+\item Correctness verification relative to baseline
+\item Live performance dashboard
+\item Explicit SIMD and GPU activity indicators
+\item Thermal-aware hybrid split control
+\end{itemize}
+
+The project is therefore no longer just a partial prototype. It functions as a coherent accelerated mobile video-processing system.
+
+\subsection{Observed Runtime Behavior}
+
+From our current device screenshots and testing:
+
+\begin{itemize}
+\item At \textbf{1280$\times$720}, baseline runs around twenty FPS, while SIMD and GPU reach around thirty FPS, and hybrid also remains interactive.
+\item At \textbf{1920$\times$1080}, baseline becomes much slower, while SIMD, GPU, and hybrid remain far better than the scalar mode.
+\item SIMD is currently the best mode in Sobel latency on our tested device.
+\item GPU is still clearly useful because it beats baseline and satisfies the GPU execution requirement, even though it does not yet outperform SIMD.
+\item Hybrid mode works correctly, shows both hardware resources as active, and adapts its split ratio during runtime.
+\end{itemize}
+
+These observations are important because they show that the assignment requirement of \textit{measurable improvement over baseline} is already satisfied by the implemented system.
+
+\section{Assignment-Oriented Evaluation}
+
+If we compare our current implementation directly against the assignment evaluation criteria, the match is as follows:
+
+\begin{itemize}
+\item \textbf{Functional correctness of output:} satisfied through baseline-referenced SIMD and GPU verification.
+\item \textbf{Achieved acceleration:} satisfied, because accelerated modes are clearly faster than baseline.
+\item \textbf{End-to-end latency and frame stability:} addressed through live E2E timing, FPS display, jitter monitoring, and switching fixes.
+\item \textbf{Quality of SIMD and GPU utilization:} visible through explicit activity indicators and actual runtime modes.
+\item \textbf{Clarity of dashboard:} improved by reducing debug clutter and keeping assignment-relevant information.
+\item \textbf{Overall system integration quality:} supported by live camera input, on-device processing, runtime switching, and stable output display.
+\end{itemize}
+
+In simple terms, the app now behaves like the kind of demonstrable system the assignment asks for.
+
+\section{What This Project Demonstrates}
+
+This project demonstrates several important ideas from mobile systems and performance engineering.
+
+First, a mobile application can meaningfully use more than one type of compute resource. CPU scalar execution, CPU SIMD execution, and GPU execution each have different strengths and costs.
+
+Second, acceleration is useful only when measured honestly in the complete pipeline. A faster kernel alone does not guarantee a better system.
+
+Third, observability matters. Without the live dashboard, the project would be much harder to evaluate or explain. The dashboard makes the behavior of the system visible and helps connect performance numbers to actual runtime behavior.
+
+Fourth, hybrid execution is not only a theoretical concept. With proper coordination, both CPU SIMD and GPU can contribute to the same frame-processing workload.
+
+\section{Conclusion}
+
+As a group of two students, we approached this project as a complete end-to-end mobile systems problem rather than a narrow optimization exercise. We began with a correct scalar baseline, then expanded the system step by step through SIMD acceleration, GPU acceleration, and finally hybrid execution. At each stage, we focused on correctness, runtime behavior, and live measurement.
+
+The final result is a real-time Android application that captures camera frames, processes them continuously on the device, displays the transformed output live, and makes the use of mobile hardware acceleration visible through a dashboard. The system now supports multiple execution modes at runtime, reports meaningful performance information, and demonstrates how heterogeneous mobile resources can be used for a real-time workload.
+
+More than just building a faster Sobel filter, the project helped us understand how camera pipelines, native code, SIMD execution, GPU compute, synchronization, and measurement all interact in a real mobile system. The most important point is that our work now matches the assignment in practical terms: live camera input, accelerated frame processing, continuous on-screen display, four runtime modes, a visible dashboard, and clear improvement over baseline. That is the main value of the work we have done.
+
+\section*{Authors' Note}
+
+We have written this report in simple English on purpose. Since the project is a systems implementation project, we wanted the report to explain our thinking and our approach clearly rather than make it unnecessarily technical in language. The work itself is technical, but the explanation should still remain readable and human.
+
+\end{document}
