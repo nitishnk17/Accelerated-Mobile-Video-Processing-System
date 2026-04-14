@@ -135,6 +135,11 @@ class MainActivity : ComponentActivity() {
     // buffer as a param so we don't allocate a fresh LongArray every hybrid frame.
     external fun nativeGetHybridStats(out: LongArray)
 
+    // phase 5 — lightweight runtime hints for the native hybrid controller so it
+    // can react to sustained heat and latency without the kotlin side micromanaging
+    // the split policy itself.
+    external fun nativeSetRuntimeHints(tempC: Float, e2eNs: Long, jitterCount: Int)
+
     companion object {
         init {
             System.loadLibrary("csproject") // loads libcsproject.so
@@ -504,9 +509,11 @@ fun CameraScreen() {
                     neonSamples     = modeSampleCounts[1]
                     gpuSamples      = modeSampleCounts[2]
                     hybridSamples   = modeSampleCounts[3]
+                    val nextJitterCount = jitterCount + if (isJitter) 1 else 0
                     if (modeChanged) transitionCount++
                     if (droppedOnSwitch) droppedDuringTransition++
-                    if (isJitter) jitterCount++
+                    if (isJitter) jitterCount = nextJitterCount
+                    activity.nativeSetRuntimeHints(thermalTempC.toFloat(), e2eNsVal, nextJitterCount)
                     // publish the adaptive split telemetry (hybrid only) — using the
                     // bg-thread snapshot, never the shared scratch buffer
                     if (haveHybridStats) {
@@ -727,19 +734,10 @@ fun CameraScreen() {
                     )
                 }
 
-                // ── PIPELINE — phase 4 stage 1 ns breakdown, two compact columns ──
+                // ── PIPELINE — keep the main processing cost visible without the
+                // low-level conversion/render breakdown that clutters the demo HUD ──
                 SectionHeader("PIPELINE")
-                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        MetricRow("YUV",  fmtNs(yuvExtractNs))
-                        MetricRow("Conv", fmtNs(conversionNs))
-                        MetricRow("Sobel", fmtNs(sobelNs), Color.Cyan, bold = true)
-                    }
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        MetricRow("BmpMk", fmtNs(bitmapCreateNs))
-                        MetricRow("Rot",   fmtNs(bitmapRotateNs))
-                    }
-                }
+                MetricRow("Sobel", fmtNs(sobelNs), Color.Cyan, bold = true)
 
                 // ── SPEEDUP — only meaningful once at least one accelerated mode has run ──
                 if (baselineSamples > 0 && (neonSamples > 0 || gpuSamples > 0 || hybridSamples > 0)) {
@@ -769,15 +767,6 @@ fun CameraScreen() {
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold
                                 )
-                                if (nH > 0 && gH > 0) {
-                                    // per-half raw timings — when the split refuses to converge
-                                    // it's almost always because one side is upload/readback
-                                    // bound, not actual compute, and you'll see it here first
-                                    Text("  N ", color = LabelGray, fontSize = 10.sp)
-                                    Text(fmtNs(nH), color = Color.LightGray, fontSize = 10.sp)
-                                    Text("  G ", color = LabelGray, fontSize = 10.sp)
-                                    Text(fmtNs(gH), color = Color.LightGray, fontSize = 10.sp)
-                                }
                             }
                         }
                     }
@@ -794,68 +783,45 @@ fun CameraScreen() {
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(top = 1.dp)
                     )
-                    Text(
-                        text = "avg of $baselineSamples/${neonSamples}/${gpuSamples}/${hybridSamples} frames",
-                        color = LabelGray,
-                        fontSize = 10.sp
-                    )
                 }
 
                 // ── SYSTEM — cpu / temp on one row, reliability counters on the next ──
                 SectionHeader("SYSTEM")
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    MetricRow("CPU", "${String.format("%.0f", cpuUsagePercent)}%")
+                    val simdActive = mode == 1 || mode == 3
+                    MetricRow(
+                        "SIMD",
+                        if (simdActive) "ACTIVE" else "IDLE",
+                        if (simdActive) Color.Green else LabelGray,
+                        bold = simdActive
+                    )
                     Spacer(Modifier.width(10.dp))
+                    val gpuActive = mode == 2 || mode == 3
+                    MetricRow(
+                        "GPU",
+                        if (gpuActive) "ACTIVE" else "IDLE",
+                        if (gpuActive) GpuOrange else LabelGray,
+                        bold = gpuActive
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     val tempColor = when {
                         thermalTempC < 0    -> Color.White
-                        thermalTempC < 40.0 -> Color.Green   // cool
-                        thermalTempC < 45.0 -> Color.Yellow  // warm
-                        else                -> Color.Red     // throttling territory
+                        thermalTempC < 40.0 -> Color.Green
+                        thermalTempC < 45.0 -> Color.Yellow
+                        else                -> Color.Red
                     }
                     MetricRow(
                         "Temp",
                         if (thermalTempC < 0) "--" else "${String.format("%.1f", thermalTempC)}°C",
                         tempColor
                     )
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Spacer(Modifier.width(10.dp))
                     MetricRow(
                         "Jit", "$jitterCount",
                         if (jitterCount < 10) Color.Green else Color.Yellow,
                         bold = true
                     )
-                    Spacer(Modifier.width(10.dp))
-                    MetricRow("Sw", "$transitionCount")
-                    Spacer(Modifier.width(10.dp))
-                    MetricRow(
-                        "Drop", "$droppedDuringTransition",
-                        if (droppedDuringTransition == 0) Color.Green else Color.Red,
-                        bold = true
-                    )
-                }
-
-                // ── VERIFY — pills only render once each underlying check has reported,
-                //    so cold-start doesn't show empty placeholders ──
-                val anyVerify = simdCheckResult != null || gpuInitResult != null ||
-                                gpuSobelCheckResult != null || gpuBenchResult != null
-                if (anyVerify) {
-                    SectionHeader("VERIFY")
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        simdCheckResult?.let { StatusPill("NEON", it.startsWith("PASS")) }
-                        gpuInitResult?.let   { StatusPill("GPU",  it.startsWith("GPU PASS")) }
-                        gpuSobelCheckResult?.let { StatusPill("SOB", it.startsWith("GPU SOBEL PASS")) }
-                        gpuBenchResult?.let {
-                            // phase 4 stage 4 winner — small orange chip in the same row
-                            val winner = it.substringAfterLast("-> ").removeSuffix(" wins")
-                            Box(
-                                modifier = Modifier
-                                    .background(GpuOrange.copy(alpha = 0.85f), BadgeShape)
-                                    .padding(horizontal = 6.dp, vertical = 2.dp)
-                            ) {
-                                Text("WG $winner", color = Color.Black, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
                 }
 
                 } // end of if (hudExpanded)

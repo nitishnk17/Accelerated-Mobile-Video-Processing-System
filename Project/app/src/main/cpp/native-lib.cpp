@@ -562,6 +562,15 @@ static GLuint g_sobelImgProg_32x4  = 0;
 static GLuint g_activeSobelImgProg = 0;  // whichever variant nativeGpuSobel/nativeHybridSobel currently dispatch
 static int    g_activeWgX = 16;          // matches the variant above — dispatch needs it to compute group count
 static int    g_activeWgY = 16;
+struct SobelUniformLocs {
+    GLint width = -1;
+    GLint height = -1;
+    GLint rowOffset = -1;
+};
+static SobelUniformLocs g_sobelLocs_8x8;
+static SobelUniformLocs g_sobelLocs_16x16;
+static SobelUniformLocs g_sobelLocs_32x4;
+static SobelUniformLocs* g_activeSobelLocs = nullptr;
 
 // phase 5 — pipelined GPU Sobel readback. we dispatch frame N into one SSBO while
 // mapping frame N-1 out of another, which avoids forcing the cpu to block on the
@@ -583,6 +592,41 @@ static double g_neonNsPerRow   = 0.0;
 static double g_gpuNsPerRow    = 0.0;
 static long   g_lastNeonHalfNs = 0;
 static long   g_lastGpuHalfNs  = 0;
+static float  g_runtimeTempC   = -1.0f;
+static long   g_runtimeE2eNs   = 0;
+static int    g_runtimeJitter  = 0;
+static int    g_lastHybridW    = 0;
+static int    g_lastHybridH    = 0;
+
+static SobelUniformLocs makeSobelUniformLocs(GLuint prog) {
+    SobelUniformLocs locs;
+    if (prog == 0) return locs;
+    locs.width     = glGetUniformLocation(prog, "uWidth");
+    locs.height    = glGetUniformLocation(prog, "uHeight");
+    locs.rowOffset = glGetUniformLocation(prog, "uRowOffset");
+    return locs;
+}
+
+static SobelUniformLocs* sobelUniformsForProgram(GLuint prog) {
+    if (prog == g_sobelImgProg_8x8)   return &g_sobelLocs_8x8;
+    if (prog == g_sobelImgProg_16x16) return &g_sobelLocs_16x16;
+    if (prog == g_sobelImgProg_32x4)  return &g_sobelLocs_32x4;
+    return nullptr;
+}
+
+static void selectActiveSobelVariant(GLuint prog, int wgX, int wgY) {
+    g_activeSobelImgProg = prog;
+    g_activeWgX = wgX;
+    g_activeWgY = wgY;
+    g_activeSobelLocs = sobelUniformsForProgram(prog);
+}
+
+static inline void setSobelUniforms(const SobelUniformLocs* locs, int width, int height, int rowOffset) {
+    if (!locs) return;
+    if (locs->width >= 0)     glUniform1i(locs->width, width);
+    if (locs->height >= 0)    glUniform1i(locs->height, height);
+    if (locs->rowOffset >= 0) glUniform1i(locs->rowOffset, rowOffset);
+}
 
 static void resetGpuSobelReadbackPipeline() {
     for (int i = 0; i < kGpuSobelReadbackDepth; i++) {
@@ -919,13 +963,16 @@ Java_com_example_csproject_MainActivity_nativeInitGpu(JNIEnv* env, jobject) {
     if (g_sobelImgProg_8x8 == 0 && g_sobelImgProg_16x16 == 0 && g_sobelImgProg_32x4 == 0) {
         return env->NewStringUTF("GPU FAIL: all image2D Sobel variants failed to compile");
     }
+    g_sobelLocs_8x8   = makeSobelUniformLocs(g_sobelImgProg_8x8);
+    g_sobelLocs_16x16 = makeSobelUniformLocs(g_sobelImgProg_16x16);
+    g_sobelLocs_32x4  = makeSobelUniformLocs(g_sobelImgProg_32x4);
 
     // default to 16x16 — usual sweet spot on mali/adreno, and a safety net in case
     // nativeBenchmarkGpuVariants never runs (e.g. bench is skipped on a shader fail).
     // nativeGpuSobel will happily use whatever is latched here, bench or not.
-    if      (g_sobelImgProg_16x16 != 0) { g_activeSobelImgProg = g_sobelImgProg_16x16; g_activeWgX = 16; g_activeWgY = 16; }
-    else if (g_sobelImgProg_8x8   != 0) { g_activeSobelImgProg = g_sobelImgProg_8x8;   g_activeWgX =  8; g_activeWgY =  8; }
-    else                                { g_activeSobelImgProg = g_sobelImgProg_32x4;  g_activeWgX = 32; g_activeWgY =  4; }
+    if      (g_sobelImgProg_16x16 != 0) selectActiveSobelVariant(g_sobelImgProg_16x16, 16, 16);
+    else if (g_sobelImgProg_8x8   != 0) selectActiveSobelVariant(g_sobelImgProg_8x8,    8,  8);
+    else                                selectActiveSobelVariant(g_sobelImgProg_32x4,   32,  4);
 
     LOGI("GPU init success — EGL %d.%d, pass-through + Sobel + image2D variants compiled", major, minor);
     char msg[128];
@@ -1127,9 +1174,7 @@ Java_com_example_csproject_MainActivity_nativeGpuSobel(
     glUseProgram(g_activeSobelImgProg);
     glBindImageTexture(0, g_inputTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpuSobelOut[writeSlot]);
-    glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uWidth"),     width);
-    glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uHeight"),    height);
-    glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uRowOffset"), 0);
+    setSobelUniforms(g_activeSobelLocs, width, height, 0);
 
     // one thread per pixel — group dims come from whichever variant the on-device
     // benchmark picked (16x16 by default until nativeBenchmarkGpuVariants runs)
@@ -1143,7 +1188,6 @@ Java_com_example_csproject_MainActivity_nativeGpuSobel(
         glDeleteSync(g_gpuSobelFence[writeSlot]);
     }
     g_gpuSobelFence[writeSlot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    glFlush();
 
     // read back the previously-dispatched slot whenever possible. after the first
     // frame this is usually already signaled, so the cpu no longer waits on the
@@ -1229,6 +1273,14 @@ Java_com_example_csproject_MainActivity_nativeVerifyGpuSobel(
         LOGI("GPU Sobel verification failed: %d mismatches, worst diff=%d", mismatches, worst);
     }
     return env->NewStringUTF(msg);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_csproject_MainActivity_nativeSetRuntimeHints(
+        JNIEnv*, jobject, jfloat tempC, jlong e2eNs, jint jitterCount) {
+    g_runtimeTempC = tempC;
+    g_runtimeE2eNs = e2eNs;
+    g_runtimeJitter = jitterCount;
 }
 
 // ============================================================
@@ -1398,12 +1450,12 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
 
     // phase 4 stage 5 — pick the split row the EMA decided on last frame.
     // reset if resolution changed so we don't use stale 720p midRow on 1080p
-    static int lastH = 0;
-    if (height != lastH) {
+    if (width != g_lastHybridW || height != g_lastHybridH) {
         g_hybridMidRow = height / 2;
         g_neonNsPerRow = 0.0;
         g_gpuNsPerRow  = 0.0;
-        lastH = height;
+        g_lastHybridW = width;
+        g_lastHybridH = height;
     }
     if (g_hybridMidRow < 0) g_hybridMidRow = height / 2;
     int midRow      = g_hybridMidRow;
@@ -1462,9 +1514,7 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
         glUseProgram(g_activeSobelImgProg);
         glBindImageTexture(0, g_inputTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_ssboOut);
-        glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uWidth"),     width);
-        glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uHeight"),    height);
-        glUniform1i(glGetUniformLocation(g_activeSobelImgProg, "uRowOffset"), midRow);
+        setSobelUniforms(g_activeSobelLocs, width, height, midRow);
 
         GLuint groupsX = (GLuint)(width      + g_activeWgX - 1) / g_activeWgX;
         GLuint groupsY = (GLuint)(bottomRows + g_activeWgY - 1) / g_activeWgY;
@@ -1497,16 +1547,27 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
     //   neonCost * top == gpuCost * (H - top)
     //   top = H * gpuCost / (neonCost + gpuCost)
     // which is what the frac expression below computes.
+    const bool highLatency = g_runtimeE2eNs > 40LL * 1000 * 1000;
+    const bool hotDevice = g_runtimeTempC >= 40.5f;
+    const bool veryHotDevice = g_runtimeTempC >= 43.0f;
+    const double alpha = (highLatency || hotDevice || g_runtimeJitter > 5) ? 0.25 : 0.10;
     if (topRows > 0 && neonHalfNs > 0) {
         double sample = (double)neonHalfNs / topRows;
-        g_neonNsPerRow = g_neonNsPerRow == 0.0 ? sample : g_neonNsPerRow * 0.9 + sample * 0.1;
+        g_neonNsPerRow = g_neonNsPerRow == 0.0 ? sample : g_neonNsPerRow * (1.0 - alpha) + sample * alpha;
     }
     if (bottomRows > 0 && gpuHalfNs > 0) {
         double sample = (double)gpuHalfNs / bottomRows;
-        g_gpuNsPerRow = g_gpuNsPerRow == 0.0 ? sample : g_gpuNsPerRow * 0.9 + sample * 0.1;
+        g_gpuNsPerRow = g_gpuNsPerRow == 0.0 ? sample : g_gpuNsPerRow * (1.0 - alpha) + sample * alpha;
     }
     if (g_neonNsPerRow > 0.0 && g_gpuNsPerRow > 0.0) {
         double frac = g_gpuNsPerRow / (g_neonNsPerRow + g_gpuNsPerRow);
+        // when the device gets hot, bias modestly toward NEON so the hybrid path
+        // doesn't keep pushing more work onto an already-heated GPU. keep the bias
+        // small so we still follow measured throughput rather than forcing a mode.
+        if (hotDevice)     frac -= 0.03;
+        if (veryHotDevice) frac -= 0.04;
+        if (frac < 0.10) frac = 0.10;
+        if (frac > 0.90) frac = 0.90;
         int next = (int)(height * frac + 0.5);
         // clamp to [10%, 90%] — a single pathological frame (gc pause, thermal
         // spike, whatever) can otherwise collapse one side to zero rows and it
@@ -1515,6 +1576,16 @@ Java_com_example_csproject_MainActivity_nativeHybridSobel(
         int hi = height - lo;
         if (next < lo) next = lo;
         if (next > hi) next = hi;
+        // avoid oscillation: if the predicted balance only moves a few rows, keep
+        // the current split. otherwise limit the maximum change per frame so the
+        // controller converges smoothly instead of seesawing on noisy samples.
+        int delta = next - g_hybridMidRow;
+        int deadband = height / 40;  // 2.5% of frame height
+        int maxStep  = height / 12;  // at most ~8% change per frame
+        if (delta < 0 && -delta <= deadband) next = g_hybridMidRow;
+        else if (delta > 0 && delta <= deadband) next = g_hybridMidRow;
+        else if (delta > maxStep) next = g_hybridMidRow + maxStep;
+        else if (delta < -maxStep) next = g_hybridMidRow - maxStep;
         g_hybridMidRow = next;
     }
     g_lastNeonHalfNs = neonHalfNs;
@@ -1616,9 +1687,7 @@ Java_com_example_csproject_MainActivity_nativeBenchmarkGpuVariants(
         if (variants[v].prog == 0) continue;  // variant didn't compile — skip, sentinel stays
 
         glUseProgram(variants[v].prog);
-        glUniform1i(glGetUniformLocation(variants[v].prog, "uWidth"),     width);
-        glUniform1i(glGetUniformLocation(variants[v].prog, "uHeight"),    height);
-        glUniform1i(glGetUniformLocation(variants[v].prog, "uRowOffset"), 0);
+        setSobelUniforms(sobelUniformsForProgram(variants[v].prog), width, height, 0);
 
         GLuint groupsX = (GLuint)(width  + variants[v].wgX - 1) / variants[v].wgX;
         GLuint groupsY = (GLuint)(height + variants[v].wgY - 1) / variants[v].wgY;
@@ -1651,9 +1720,7 @@ Java_com_example_csproject_MainActivity_nativeBenchmarkGpuVariants(
         // shouldn't happen — init already gated on at least one variant compiling
         return env->NewStringUTF("GPU BENCH FAIL: no variants available");
     }
-    g_activeSobelImgProg = variants[best].prog;
-    g_activeWgX = variants[best].wgX;
-    g_activeWgY = variants[best].wgY;
+    selectActiveSobelVariant(variants[best].prog, variants[best].wgX, variants[best].wgY);
 
     // format each slot as "NNNus" or "FAIL" so a failed variant doesn't print a
     // 1e18 garbage number that blows through the buffer
