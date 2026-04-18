@@ -56,7 +56,7 @@ import kotlin.math.min
 
 // logcat tag — filter by "CSProject" in android studio
 private const val TAG = "CSProject"
-private const val MODE_COUNT = 4
+private const val MODE_COUNT = 5  // 0=Base 1=SIMD 2=GPU 3=Hyb 4=Raw (no-filter passthrough, UI-leftmost)
 private const val SPEEDUP_WARMUP_FRAMES = 3
 private const val SPEEDUP_MAX_SAMPLES = 30
 
@@ -422,11 +422,14 @@ fun CameraScreen() {
 
                 // stage 3: sobel (active mode)
                 val sobelStartNs = System.nanoTime()
-                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU  3=Hybrid
+                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU  3=Hybrid  4=Raw
+                // raw just hands the camera rgba back — no jni, no copy. that tiny sobelNs
+                // reading you'll see for mode 4 is literally the cost of this when-dispatch
                 val edgeBytes = when (currentMode) {
                     1    -> activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
                     2    -> activity.nativeGpuSobel(rgbaBytes, image.width, image.height)
                     3    -> activity.nativeHybridSobel(rgbaBytes, image.width, image.height)
+                    4    -> rgbaBytes
                     else -> activity.nativeSobelFilter(rgbaBytes, image.width, image.height)
                 }
                 val sobelNsVal = System.nanoTime() - sobelStartNs
@@ -872,6 +875,10 @@ fun CameraScreen() {
                 .clip(PillShape)
                 .background(Color.Black.copy(alpha = 0.6f))
         ) {
+            // raw sits leftmost for eyeball comparison — tap it to see the un-sobeled camera,
+            // tap any other pill to see the filter. ui order != index order (raw is index 4) so
+            // every existing mode-index check downstream keeps working without a rewrite
+            ModePill("Raw",  4, mode) { mode = 4 }
             ModePill("Base", 0, mode) { mode = 0 }
             ModePill("SIMD", 1, mode) { mode = 1 }
             ModePill("GPU",  2, mode) { mode = 2 }
@@ -898,14 +905,16 @@ private fun modeAccent(mode: Int): Color = when (mode) {
     0    -> Color.Cyan
     1    -> Color.Green
     2    -> GpuOrange
-    else -> Color.Magenta
+    3    -> Color.Magenta
+    else -> Color.White         // raw — neutral, reads as "no processing applied"
 }
 
 private fun modeName(mode: Int): String = when (mode) {
     0    -> "BASELINE"
     1    -> "SIMD"
     2    -> "GPU"
-    else -> "HYBRID"
+    3    -> "HYBRID"
+    else -> "RAW"
 }
 
 // tiny uppercase divider — replaces the bare 0.5dp lines from the old hud.
