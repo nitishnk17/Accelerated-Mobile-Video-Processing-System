@@ -1,4 +1,4 @@
-# LaTeX build artifacts
+# latex files
 *.aux
 *.log
 *.toc
@@ -17,10 +17,10 @@
 *.lof
 *.lot
 
-# Generated PDF (compile locally, don't track)
+# pdf files
 *.pdf
 
-# Editor files
+# editor files
 *.swp
 *.swo
 *~

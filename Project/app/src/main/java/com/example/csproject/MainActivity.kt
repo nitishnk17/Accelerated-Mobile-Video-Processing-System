@@ -54,19 +54,21 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.min
 
-// logcat tag — filter by "CSProject" in android studio
+// label for logs
 private const val TAG = "CSProject"
-private const val MODE_COUNT = 5  // 0=Base 1=SIMD 2=GPU 3=Hyb 4=Raw (no-filter passthrough, UI-leftmost)
+// total number of modes
+private const val MODE_COUNT = 5
+// frames to wait before checking speed
 private const val SPEEDUP_WARMUP_FRAMES = 3
+// max frames to average
 private const val SPEEDUP_MAX_SAMPLES = 30
 
 class MainActivity : ComponentActivity() {
 
-    // body implemented in native-lib.cpp via JNI
+    // check native side status
     external fun nativeGetStatus(): String
 
-    // converts yuv_420_888 planes to rgba using bt.601 in native code
-    // stores result in a new bytearray and returns it to kotlin
+    // turn camera data into pixels
     external fun nativeYuvToRgba(
         yBytes: ByteArray, uBytes: ByteArray, vBytes: ByteArray,
         width: Int, height: Int,
@@ -74,81 +76,76 @@ class MainActivity : ComponentActivity() {
 
     ): ByteArray
 
-    // runs 3x3 sobel edge detection on an rgba buffer
+    // normal cpu edge detection
     external fun nativeSobelFilter(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
-    // neon warm-up — grayscale using uint8x16_t vectors (16 pixels at once)
+    // test neon grayscale
     external fun nativeGrayscaleNeon(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
-    // phase 2 stage 2 — neon-accelerated sobel edge detection (16 pixels per iteration)
+    // fast cpu edge detection
     external fun nativeSobelNeon(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
-    // phase 2 stage 3 — compares neon sobel output against a scalar reference, returns "PASS: ..." / "FAIL: ..."
+    // check if neon matches normal cpu
     external fun nativeVerifySobelCorrectness(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
 
-    // phase 3 stage 1 — spins up a headless EGL context and compiles the pass-through compute shader
-    // must be called on the thread that will subsequently make OpenGL ES calls
+    // setup gpu
     external fun nativeInitGpu(): String
 
-    // phase 3 stage 1 — copies rgbaBytes through a GPU SSBO pass-through compute shader
+    // test gpu data move
     external fun nativeGpuPassThrough(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
-    // phase 3 stage 1 — verifies that the SSBO round-trip produces an exact copy, returns "GPU PASS/FAIL: ..."
+    // check if gpu data move works
     external fun nativeVerifyGpuPassThrough(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
 
-    // phase 3 stage 2 — runs Sobel edge detection on the GPU via compute shader + SSBOs
+    // fast gpu edge detection
     external fun nativeGpuSobel(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
-    // phase 3 stage 3: checks if the gpu sobel output actually matches the scalar baseline
+    // check if gpu matches normal cpu
     external fun nativeVerifyGpuSobel(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
 
-    // phase 3 stage 4: hybrid sobel — NEON top half + GPU bottom half concurrently
+    // use cpu and gpu together
     external fun nativeHybridSobel(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): ByteArray
 
-    // phase 4 stage 4 — times the image2D Sobel workgroup-size variants on the real
-    // device and latches the fastest one for subsequent nativeGpuSobel/nativeHybridSobel calls.
-    // returns a "GPU BENCH: ..." status string.
+    // find best gpu settings
     external fun nativeBenchmarkGpuVariants(
         rgbaBytes: ByteArray, width: Int, height: Int
     ): String
 
-    // phase 4 stage 5 — peek at the adaptive hybrid split state. writes into a
-    // caller-owned long[3]: [midRow, lastNeonHalfNs, lastGpuHalfNs]. takes the
-    // buffer as a param so we don't allocate a fresh LongArray every hybrid frame.
+    // get numbers for hybrid mode
     external fun nativeGetHybridStats(out: LongArray)
 
-    // phase 5 — lightweight runtime hints for the native hybrid controller so it
-    // can react to sustained heat and latency without the kotlin side micromanaging
-    // the split policy itself.
+    // update native code with system info
     external fun nativeSetRuntimeHints(tempC: Float, e2eNs: Long, jitterCount: Int)
 
     companion object {
         init {
-            System.loadLibrary("csproject") // loads libcsproject.so
+            // load native code
+            System.loadLibrary("csproject")
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Log.d(TAG, nativeGetStatus()) // verify JNI bridge at startup
+        // log startup status
+        Log.d(TAG, nativeGetStatus())
         setContent { CameraApp() }
     }
 }
@@ -156,21 +153,22 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun CameraApp() {
+    // manage camera permission
     val cameraPermissionState = rememberPermissionState(Manifest.permission.CAMERA)
 
     if (cameraPermissionState.status.isGranted) {
         CameraScreen()
     } else {
-        // show permission prompt until user grants camera access
+        // ask for permission if missing
         Column(
             modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Text("Camera permission is required.")
+            Text("camera permission is required.")
             Spacer(modifier = Modifier.height(8.dp))
             Button(onClick = { cameraPermissionState.launchPermissionRequest() }) {
-                Text("Request Permission")
+                Text("request permission")
             }
         }
     }
@@ -180,9 +178,8 @@ fun CameraApp() {
 fun CameraScreen() {
     val context = LocalContext.current
 
-    // dashboard state — each var triggers only its own text to recompose
+    // track performance numbers
     var currentFps       by remember { mutableStateOf(0.0) }
-    // phase 4 stage 1 — nanosecond-precision per-stage latency breakdown
     var yuvExtractNs     by remember { mutableStateOf(0L) }
     var conversionNs     by remember { mutableStateOf(0L) }
     var sobelNs          by remember { mutableStateOf(0L) }
@@ -192,18 +189,15 @@ fun CameraScreen() {
     var cpuUsagePercent  by remember { mutableStateOf(0.0) }
     var frameIntervalMs  by remember { mutableStateOf(-1L) }
 
-    // hold the latest rotated rgba bitmap for display
+    // store the processed image
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    // 0=Baseline  1=SIMD  2=GPU  3=Hybrid — cycles on button tap
+    // current processing mode
     var mode            by remember { mutableStateOf(0) }
-    // hud expand/collapse — when false, only the mode + fps header stays on
-    // screen so the camera feed isn't crowded out during a demo
+    // toggle dashboard view
     var hudExpanded     by remember { mutableStateOf(true) }
     var simdCheckResult by remember { mutableStateOf<String?>(null) }
 
-    // speedup uses stabilized per-mode running averages instead of raw single-frame
-    // timings. otherwise "Base" keeps moving when you switch back to baseline while
-    // the accelerated rows are stale snapshots from earlier frames/modes.
+    // keep track of averages
     var baselineSobelNs by remember { mutableStateOf(0L) }
     var neonSobelNs     by remember { mutableStateOf(0L) }
     var gpuSobelNs      by remember { mutableStateOf(0L) }
@@ -213,40 +207,34 @@ fun CameraScreen() {
     var gpuSamples      by remember { mutableStateOf(0) }
     var hybridSamples   by remember { mutableStateOf(0) }
 
-    // phase 4 stage 5 — adaptive hybrid split telemetry, pulled from native once per
-    // hybrid frame. midRow == 0 means "haven't seen a hybrid frame yet" — we gate
-    // the dashboard row on that so cold-start doesn't flash a meaningless "0 rows".
+    // hybrid mode info
     var hybridMidRow     by remember { mutableStateOf(0) }
     var hybridNeonHalfNs by remember { mutableStateOf(0L) }
     var hybridGpuHalfNs  by remember { mutableStateOf(0L) }
 
-    // resolution state — 720p default, toggles to 1080p
+    // image size settings
     var resW by remember { mutableStateOf(1280) }
     var resH by remember { mutableStateOf(720) }
     var isSwitchingRes by remember { mutableStateOf(false) }
 
-    // phase 3 stage 5 — tracks mode switches and any frame drops that happen mid-transition
+    // stats on mode changes
     var transitionCount         by remember { mutableStateOf(0) }
     var droppedDuringTransition by remember { mutableStateOf(0) }
-    val lastModeRef = remember { intArrayOf(0) }  // mutable from the callback, same trick as lastHwTimestampNs
+    val lastModeRef = remember { intArrayOf(0) }
 
-    // phase 3 stage 6 — keeps an eye on frame time spikes and soc temperature under sustained load
+    // thermal and timing stats
     var jitterCount  by remember { mutableStateOf(0) }
     var thermalTempC by remember { mutableStateOf(-1.0) }
-    val rollingE2eMs = remember { doubleArrayOf(0.0) }  // callback-mutable like lastHwTimestampNs
+    val rollingE2eMs = remember { doubleArrayOf(0.0) }
 
-    // phase 3 stage 1 — GPU init + pass-through SSBO verification result
+    // gpu status tracking
     var gpuInitResult by remember { mutableStateOf<String?>(null) }
-    // phase 3 stage 3: did the gpu sobel pass or fail the correctness check
     var gpuSobelCheckResult by remember { mutableStateOf<String?>(null) }
-    // phase 4 stage 4 — workgroup-variant benchmark result ("GPU BENCH: ... -> NxN wins")
     var gpuBenchResult by remember { mutableStateOf<String?>(null) }
-    val gpuInitDone   = remember { booleanArrayOf(false) }  // run only once, on first frame
+    val gpuInitDone   = remember { booleanArrayOf(false) }
 
-    // phase 4 stage 2 — pre-allocated buffers to eliminate per-frame GC pressure
-    // rawBmp: un-rotated edge output; reused via copyPixelsFromBuffer (no allocation)
+    // setup memory for frames
     val rawBmp = remember(resW, resH) { Bitmap.createBitmap(resW, resH, Bitmap.Config.ARGB_8888) }
-    // double-buffered rotated bitmaps: background writes to back, UI reads front
     val rotBitmaps  = remember(resW, resH) {
         arrayOf(
             Bitmap.createBitmap(resH, resW, Bitmap.Config.ARGB_8888),
@@ -254,59 +242,51 @@ fun CameraScreen() {
         )
     }
     val rotCanvases = remember(resW, resH) { arrayOf(Canvas(rotBitmaps[0]), Canvas(rotBitmaps[1])) }
-    // postRotate(90) maps (x,y)->(-y,x), which shifts the image to negative x.
-    // postTranslate(H,0) brings it back: the image spans x=[0,H], y=[0,W]
     val rotMatrix   = remember(resW, resH) { Matrix().apply { postRotate(90f); postTranslate(resH.toFloat(), 0f) } }
-    val backIdxRef  = remember { intArrayOf(0) }  // which rotBitmap the bg thread writes to next
-    // lazily-sized yuv plane byte arrays; allocated on first frame, reused every frame after
+    val backIdxRef  = remember { intArrayOf(0) }
     val yBufRef = remember { arrayOfNulls<ByteArray>(1) }
-    // phase 4 stage 5 — preallocated scratch for nativeGetHybridStats so the jni
-    // call doesn't allocate a fresh long[] per hybrid frame
     val hybridStatsBuf = remember { LongArray(3) }
     val uBufRef = remember { arrayOfNulls<ByteArray>(1) }
     val vBufRef = remember { arrayOfNulls<ByteArray>(1) }
 
-    // need a reference to the activity to call the jni method
     val activity = context as MainActivity
 
-    // non-reactive refs used only for cleanup on dispose
+    // camera handles
     val cameraDeviceRef   = remember { arrayOfNulls<CameraDevice>(1) }
     val captureSessionRef = remember { arrayOfNulls<CameraCaptureSession>(1) }
     val textureViewRef    = remember { arrayOfNulls<TextureView>(1) }
     val cameraOpenGenRef  = remember { intArrayOf(0) }
 
-    // background thread for all camera2 callbacks; keeps ui thread free
+    // worker threads
     val backgroundThread  = remember { HandlerThread("Camera2Background").also { it.start() } }
     val backgroundHandler = remember { Handler(backgroundThread.looper) }
     val mainHandler       = remember { Handler(Looper.getMainLooper()) }
 
-    // receives raw yuv_420_888 frames; maxImages=2 prevents stalls
+    // frame receiver
     val imageReader = remember(resW, resH) {
         ImageReader.newInstance(resW, resH, ImageFormat.YUV_420_888, 2)
     }
-    // ensure old ImageReader is closed when resolution changes
+    // clean up reader
     DisposableEffect(imageReader) {
         onDispose { imageReader.close() }
     }
 
-    // rolling window of last 30 frame arrival timestamps for stable fps
+    // history of frame times
     val frameTimestamps = remember { ArrayDeque<Long>() }
-
-    // previous frame hardware timestamp (ns); longarray lets the lambda mutate it
     val lastHwTimestampNs = remember { longArrayOf(-1L) }
-    val verifyOnce = remember { booleanArrayOf(false) }  // run neon check on first frame only
+    val verifyOnce = remember { booleanArrayOf(false) }
     val modeWarmupFrames = remember { IntArray(MODE_COUNT) }
     val modeSampleCounts = remember { IntArray(MODE_COUNT) }
     val modeAveragesNs   = remember { LongArray(MODE_COUNT) }
 
-    // poll cpu usage every ~1 s from /proc/stat
+    // refresh cpu stats
     LaunchedEffect(Unit) {
         while (true) {
             cpuUsagePercent = measureCpuUsage()
             delay(500)
         }
     }
-    // battery temp updates slowly so 2 s is plenty
+    // refresh temperature
     LaunchedEffect(Unit) {
         while (true) {
             thermalTempC = readBatteryTemp(context)
@@ -314,6 +294,7 @@ fun CameraScreen() {
         }
     }
 
+    // handle frames as they arrive
     DisposableEffect(resW, resH) {
         imageReader.setOnImageAvailableListener({ reader ->
             if (isSwitchingRes) {
@@ -322,17 +303,15 @@ fun CameraScreen() {
             }
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
 
-            // ATOMIC CHECK: If the image width doesn't match our current resW,
-            // it's a "ghost frame" from the previous resolution. DROP IT.
+            // filter out wrong frame sizes
             if (image.width != resW || image.height != resH) {
                 image.close()
                 return@setOnImageAvailableListener
             }
 
             try {
-                // phase 4 stage 1 — nanosecond capture timestamp; drives e2e latency
+                // start frame timer
                 val frameArrivalNs = System.nanoTime()
-                // currentTimeMillis still used for the fps rolling window (wall-clock ms is fine there)
                 val frameArrivalWallMs = System.currentTimeMillis()
                 frameTimestamps.addLast(frameArrivalWallMs)
                 if (frameTimestamps.size > 30) frameTimestamps.removeFirst()
@@ -341,13 +320,13 @@ fun CameraScreen() {
                     if (spanMs > 0) (frameTimestamps.size - 1) * 1000.0 / spanMs else 0.0
                 } else 0.0
 
-                // inter-frame interval from hardware timestamps; ~33 ms at 30 fps
+                // check delay between frames
                 val hwTimestampNs = image.timestamp
                 val intervalMs = if (lastHwTimestampNs[0] > 0L)
                     (hwTimestampNs - lastHwTimestampNs[0]) / 1_000_000L else -1L
                 lastHwTimestampNs[0] = hwTimestampNs
 
-                // stage 1: yuv plane extraction — reuse pre-allocated byte arrays (no GC alloc after first frame)
+                // pull data from image planes
                 val yuvExtractStart = System.nanoTime()
                 val yPlane = image.planes[0]
                 val uPlane = image.planes[1]
@@ -363,7 +342,7 @@ fun CameraScreen() {
                 val vBytes = vBufRef[0]!!.also { vPlane.buffer.get(it) }
                 val yuvExtractNsVal = System.nanoTime() - yuvExtractStart
 
-                // stage 2: yuv->rgba conversion (jni)
+                // convert data to colors
                 val convStartNs = System.nanoTime()
                 val rgbaBytes = activity.nativeYuvToRgba(
                     yBytes, uBytes, vBytes,
@@ -374,41 +353,36 @@ fun CameraScreen() {
 
                 if (rgbaBytes.isEmpty()) return@setOnImageAvailableListener
 
-                // phase 2 stage 3 — one shot neon correctness check on the first frame
+                // verify neon once
                 if (!verifyOnce[0]) {
                     verifyOnce[0] = true
                     val result = activity.nativeVerifySobelCorrectness(rgbaBytes, image.width, image.height)
                     mainHandler.post { simdCheckResult = result }
                 }
 
-                // phase 3 stage 1 — initialize the headless EGL context on this background thread
-                // then immediately verify SSBO round-trip correctness with the pass-through shader
-                // must happen here (not in onCreate) so the EGL context is bound to this thread
+                // start gpu if needed
                 if (!gpuInitDone[0]) {
                     gpuInitDone[0] = true
                     val initMsg = activity.nativeInitGpu()
                     val verifyMsg = if (initMsg.startsWith("GPU OK"))
                         activity.nativeVerifyGpuPassThrough(rgbaBytes, image.width, image.height)
                     else
-                        initMsg  // propagate the init failure as the verify result
+                        initMsg
                     mainHandler.post { gpuInitResult = verifyMsg }
 
-                    // only bother checking sobel correctness if the ssbo pipeline itself works
                     if (verifyMsg.startsWith("GPU PASS")) {
-                        // phase 4 stage 4 — race the image2D sobel workgroup variants before
-                        // correctness verification runs, so whatever verify passes/fails on is
-                        // the exact variant the live pipeline will dispatch for every subsequent frame
+                        // test gpu variants
                         val benchMsg = activity.nativeBenchmarkGpuVariants(rgbaBytes, image.width, image.height)
                         mainHandler.post { gpuBenchResult = benchMsg }
 
+                        // verify gpu sobel
                         val sobelVerify = activity.nativeVerifyGpuSobel(rgbaBytes, image.width, image.height)
                         mainHandler.post { gpuSobelCheckResult = sobelVerify }
                     }
                 }
 
-                // grab mode once so a button tap mid-frame can't mix two paths
+                // pick current mode
                 var currentMode = mode
-                // gpu/hybrid before egl init would return an empty buffer -> black flash
                 if ((currentMode == 2 || currentMode == 3) && !gpuInitDone[0]) {
                     currentMode = 0
                 }
@@ -420,11 +394,8 @@ fun CameraScreen() {
                     modeWarmupFrames[currentMode] = SPEEDUP_WARMUP_FRAMES
                 }
 
-                // stage 3: sobel (active mode)
+                // run selected filter
                 val sobelStartNs = System.nanoTime()
-                // route frame to active mode: 0=Baseline  1=SIMD  2=GPU  3=Hybrid  4=Raw
-                // raw just hands the camera rgba back — no jni, no copy. that tiny sobelNs
-                // reading you'll see for mode 4 is literally the cost of this when-dispatch
                 val edgeBytes = when (currentMode) {
                     1    -> activity.nativeSobelNeon(rgbaBytes, image.width, image.height)
                     2    -> activity.nativeGpuSobel(rgbaBytes, image.width, image.height)
@@ -436,9 +407,7 @@ fun CameraScreen() {
 
                 if (edgeBytes.isEmpty()) return@setOnImageAvailableListener
 
-                // phase 4 stage 5 — only probe hybrid stats on the frame we actually
-                // ran hybrid on. one jni call, three longs into a preallocated scratch
-                // buffer — zero per-frame garbage.
+                // get hybrid mode stats
                 val haveHybridStats = currentMode == 3
                 var hybridMidRowSnap = 0
                 var hybridNeonSnap   = 0L
@@ -450,22 +419,22 @@ fun CameraScreen() {
                     hybridGpuSnap    = hybridStatsBuf[2]
                 }
 
-                // stage 4: fill pre-allocated rawBmp with edge pixels — no Bitmap allocation
+                // create bitmap for display
                 val bmpCreateStartNs = System.nanoTime()
                 rawBmp.copyPixelsFromBuffer(ByteBuffer.wrap(edgeBytes))
                 val bmpCreateNsVal = System.nanoTime() - bmpCreateStartNs
 
-                // stage 5: draw into the back-buffer rotated Bitmap via pre-allocated Canvas — no allocation
+                // rotate bitmap for screen
                 val bmpRotateStartNs = System.nanoTime()
                 val backIdx = backIdxRef[0]
                 rotCanvases[backIdx].drawBitmap(rawBmp, rotMatrix, null)
-                backIdxRef[0] = 1 - backIdx  // flip immediately so next frame uses the other buffer
+                backIdxRef[0] = 1 - backIdx
                 val bmpRotateNsVal = System.nanoTime() - bmpRotateStartNs
 
-                // total e2e from camera frame arrival to display-ready
+                // total frame time
                 val e2eNsVal = System.nanoTime() - frameArrivalNs
 
-                // flag frames where e2e blows past 2x the running average (compare in ms)
+                // check for timing jumps
                 val e2eMs = e2eNsVal / 1_000_000.0
                 val avg = rollingE2eMs[0]
                 val isJitter = avg > 0.0 && e2eMs > avg * 2.0
@@ -473,6 +442,7 @@ fun CameraScreen() {
 
                 val droppedOnSwitch = modeChanged && intervalMs > 40L
 
+                // send data to ui
                 mainHandler.post {
                     currentFps      = fps
                     yuvExtractNs    = yuvExtractNsVal
@@ -482,10 +452,9 @@ fun CameraScreen() {
                     bitmapRotateNs  = bmpRotateNsVal
                     endToEndNs      = e2eNsVal
                     frameIntervalMs = intervalMs
-                    processedBitmap = rotBitmaps[backIdx]  // show the just-written back buffer
-                    // SPEEDUP uses stabilized per-mode averages. skip a few frames after
-                    // each mode switch so camera/session/GPU pipeline transitions don't
-                    // poison the numbers. cap samples so old history decays naturally.
+                    processedBitmap = rotBitmaps[backIdx]
+                    
+                    // compute averages for speedup
                     if (modeWarmupFrames[currentMode] > 0) {
                         modeWarmupFrames[currentMode]--
                     } else {
@@ -517,8 +486,8 @@ fun CameraScreen() {
                     if (droppedOnSwitch) droppedDuringTransition++
                     if (isJitter) jitterCount = nextJitterCount
                     activity.nativeSetRuntimeHints(thermalTempC.toFloat(), e2eNsVal, nextJitterCount)
-                    // publish the adaptive split telemetry (hybrid only) — using the
-                    // bg-thread snapshot, never the shared scratch buffer
+                    
+                    // update split info for hybrid
                     if (haveHybridStats) {
                         hybridMidRow     = hybridMidRowSnap
                         hybridNeonHalfNs = hybridNeonSnap
@@ -526,7 +495,8 @@ fun CameraScreen() {
                     }
                 }
             } finally {
-                image.close() // must close every image or camera stalls
+                // free frame data
+                image.close()
             }
         }, backgroundHandler)
 
@@ -535,6 +505,7 @@ fun CameraScreen() {
         }
     }
 
+    // restart camera sequence
     val restartCamera: (String) -> Unit = fun(reason: String) {
         val textureView = textureViewRef[0]
         val surfaceTexture = textureView?.surfaceTexture
@@ -575,6 +546,7 @@ fun CameraScreen() {
     }
     val latestRestartCamera by rememberUpdatedState(restartCamera)
 
+    // reset stats on resize
     LaunchedEffect(resW, resH, imageReader) {
         gpuInitDone[0] = false
         verifyOnce[0] = false
@@ -598,6 +570,7 @@ fun CameraScreen() {
         }
     }
 
+    // clean up camera resources
     DisposableEffect(Unit) {
         onDispose {
             cameraOpenGenRef[0]++
@@ -613,9 +586,8 @@ fun CameraScreen() {
     Box(modifier = Modifier
         .fillMaxSize()
         .background(Color.Black)){
-        // hidden textureview - still needed to drive the camera pipeline
-        // size 0.dp makes it visible but still receives frames
-
+        
+        // camera view component
         AndroidView(
             modifier = Modifier.size(0.dp),
             factory = { ctx ->
@@ -643,7 +615,7 @@ fun CameraScreen() {
             }
         )
 
-        // display the edge-detected frame (whichever sobel path is active)
+        // show frame on screen
         processedBitmap?.let { bitmap ->
             Image(
                 bitmap = bitmap.asImageBitmap(),
@@ -653,18 +625,14 @@ fun CameraScreen() {
             )
         }
 
-        // active mode color drives every accent on screen — the hud's left bar,
-        // the mode header, and whichever segmented pill is currently filled.
-        // one source of truth so a glance tells you which path is live.
+        // color for current mode
         val accent = modeAccent(mode)
 
-        // top-left hud card. the 3dp accent stripe is a sibling of the metrics
-        // column inside an IntrinsicSize.Min row, so it stretches to whatever
-        // height the content lands at — no drawBehind, no remeasure dance.
+        // dashboard layout
         Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(12.dp)
+                .padding(top = 50.dp, start = 12.dp, end = 12.dp, bottom = 12.dp)
                 .clip(CardShape)
                 .background(Color.Black.copy(alpha = 0.55f))
                 .height(IntrinsicSize.Min)
@@ -675,7 +643,7 @@ fun CameraScreen() {
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(3.dp)
             ) {
-                // ── header: mode name + the hero fps number + collapse toggle ──
+                // fps and mode display
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         text = modeName(mode),
@@ -697,9 +665,7 @@ fun CameraScreen() {
                     )
                     Text(" fps", color = LabelGray, fontSize = 10.sp)
                     Spacer(Modifier.width(12.dp))
-                    // tiny chevron toggle — ▾ when expanded, ▸ when collapsed.
-                    // big invisible padding makes the tap target finger-friendly
-                    // even though the glyph itself is small
+                    // toggle more info
                     Box(
                         modifier = Modifier
                             .clickable { hudExpanded = !hudExpanded }
@@ -717,9 +683,7 @@ fun CameraScreen() {
 
                 if (hudExpanded) {
 
-                // sub-header — e2e latency (the other hero) and frame interval.
-                // interval goes yellow if it drifts outside the 28..38 ms window
-                // around 30 fps, which usually means a dropped/late frame.
+                // total time info
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("E2E ", color = LabelGray, fontSize = 11.sp)
                     Text(
@@ -737,12 +701,11 @@ fun CameraScreen() {
                     )
                 }
 
-                // ── PIPELINE — keep the main processing cost visible without the
-                // low-level conversion/render breakdown that clutters the demo HUD ──
+                // processing time
                 SectionHeader("PIPELINE")
                 MetricRow("Sobel", fmtNs(sobelNs), Color.Cyan, bold = true)
 
-                // ── SPEEDUP — only meaningful once at least one accelerated mode has run ──
+                // speed gains
                 if (baselineSamples > 0 && (neonSamples > 0 || gpuSamples > 0 || hybridSamples > 0)) {
                     SectionHeader("SPEEDUP")
                     MetricRow("Base", fmtNs(baselineSobelNs), Color.Cyan)
@@ -752,10 +715,7 @@ fun CameraScreen() {
                         MetricRow("GPU ", fmtNs(gpuSobelNs), GpuOrange)
                     if (hybridSamples > 0) {
                         MetricRow("Hyb ", fmtNs(hybridSobelNs), Color.Magenta)
-                        // phase 4 stage 5 — adaptive split readout. midRow == 0 is the
-                        // "haven't seen a hybrid frame yet" sentinel, so we gate on it.
-                        // green once both halves finish within 10% of each other,
-                        // yellow while the controller is still chasing the balance.
+                        // hybrid row split
                         if (hybridMidRow > 0) {
                             val neonPct = (hybridMidRow * 100) / resH
                             val nH = hybridNeonHalfNs
@@ -788,7 +748,7 @@ fun CameraScreen() {
                     )
                 }
 
-                // ── SYSTEM — cpu / temp on one row, reliability counters on the next ──
+                // system health info
                 SectionHeader("SYSTEM")
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     val simdActive = mode == 1 || mode == 3
@@ -827,15 +787,15 @@ fun CameraScreen() {
                     )
                 }
 
-                } // end of if (hudExpanded)
+                }
             }
         }
 
-        // resolution toggle in the top-right corner
+        // resolution toggle
         Row(
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(12.dp)
+                .padding(top = 50.dp, end = 12.dp, start = 12.dp, bottom = 12.dp)
                 .clip(CardShape)
                 .background(Color.Black.copy(alpha = 0.55f))
                 .padding(4.dp)
@@ -865,9 +825,7 @@ fun CameraScreen() {
             }
         }
 
-        // segmented mode switcher pinned to bottom-center. one tap per mode
-        // beats the old cycle button — and stress-tap testing still works,
-        // just mash any pill and watch Switches climb.
+        // mode selection bar
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -875,40 +833,38 @@ fun CameraScreen() {
                 .clip(PillShape)
                 .background(Color.Black.copy(alpha = 0.6f))
         ) {
-            // raw sits leftmost for eyeball comparison — tap it to see the un-sobeled camera,
-            // tap any other pill to see the filter. ui order != index order (raw is index 4) so
-            // every existing mode-index check downstream keeps working without a rewrite
-            ModePill("Raw",  4, mode) { mode = 4 }
-            ModePill("Base", 0, mode) { mode = 0 }
-            ModePill("SIMD", 1, mode) { mode = 1 }
-            ModePill("GPU",  2, mode) { mode = 2 }
-            ModePill("Hyb",  3, mode) { mode = 3 }
+            ModePill("raw",  4, mode) { mode = 4 }
+            ModePill("base", 0, mode) { mode = 0 }
+            ModePill("simd", 1, mode) { mode = 1 }
+            ModePill("gpu",  2, mode) { mode = 2 }
+            ModePill("hyb",  3, mode) { mode = 3 }
         }
     }
 }
 
-// phase 4 stage 1 — formats a nanosecond duration as milliseconds (2 decimal places)
+// format time into readable ms
 fun fmtNs(ns: Long): String = "${String.format("%.2f", ns / 1_000_000.0)} ms"
 
-// hoisted shapes/colors for the dashboard. top-level vals so the hud (which
-// recomposes ~30x/s) doesn't re-allocate a fresh Shape or Color every frame.
+// dashboard style settings
 private val CardShape  = RoundedCornerShape(10.dp)
 private val PillShape  = RoundedCornerShape(20.dp)
 private val BadgeShape = RoundedCornerShape(4.dp)
-private val LabelGray  = Color(0xFFB0B0B0)   // metric labels (slightly brighter)
-private val DimGray    = Color(0xFF9E9E9E)   // section header dimmer
+private val LabelGray  = Color(0xFFB0B0B0)
+private val DimGray    = Color(0xFF9E9E9E)
 private val GpuOrange  = Color(0xFFFF9800)
 private val PassGreen  = Color(0xFF1B5E20)
 private val FailRed    = Color(0xFFB71C1C)
 
+// get color for current mode
 private fun modeAccent(mode: Int): Color = when (mode) {
     0    -> Color.Cyan
     1    -> Color.Green
     2    -> GpuOrange
     3    -> Color.Magenta
-    else -> Color.White         // raw — neutral, reads as "no processing applied"
+    else -> Color.White
 }
 
+// get name for current mode
 private fun modeName(mode: Int): String = when (mode) {
     0    -> "BASELINE"
     1    -> "SIMD"
@@ -917,8 +873,7 @@ private fun modeName(mode: Int): String = when (mode) {
     else -> "RAW"
 }
 
-// tiny uppercase divider — replaces the bare 0.5dp lines from the old hud.
-// inputs are stable so compose smart-skips this whenever the label is unchanged
+// dashboard section header
 @Composable
 private fun SectionHeader(text: String) {
     Text(
@@ -931,9 +886,7 @@ private fun SectionHeader(text: String) {
     )
 }
 
-// label + value on one row. all params are stable types so compose can skip
-// rows whose value string didn't change this frame — only the few metrics
-// that actually move (FPS, Sobel, E2E…) re-execute, the rest stay cached
+// dashboard metric row
 @Composable
 private fun MetricRow(
     label: String,
@@ -953,7 +906,7 @@ private fun MetricRow(
     }
 }
 
-// little colored chip for the VERIFY block. green = check passed, red = check failed
+// status pill for ui
 @Composable
 private fun StatusPill(label: String, ok: Boolean) {
     Box(
@@ -965,10 +918,7 @@ private fun StatusPill(label: String, ok: Boolean) {
     }
 }
 
-// one cell of the segmented mode switcher. the active pill fills with the
-// mode's accent color, the others stay transparent on top of the row's
-// shared dark background — that one shared bg is what gives the segmented
-// look without us having to draw any borders between cells
+// mode button pill
 @Composable
 private fun ModePill(label: String, idx: Int, active: Int, onClick: () -> Unit) {
     val isActive = idx == active
@@ -988,7 +938,7 @@ private fun ModePill(label: String, idx: Int, active: Int, onClick: () -> Unit) 
     }
 }
 
-// reads /proc/stat twice 500 ms apart and returns cpu busy percentage
+// read system cpu usage
 suspend fun measureCpuUsage(): Double {
     fun readStats(): LongArray = try {
         val line = File("/proc/stat").readLines().firstOrNull() ?: return LongArray(8)
@@ -1000,20 +950,18 @@ suspend fun measureCpuUsage(): Double {
     val s2 = readStats()
 
     val totalDelta = s2.sum() - s1.sum()
-    val idleDelta  = (s2[3] + s2[4]) - (s1[3] + s1[4]) // index 3=idle, 4=iowait
+    val idleDelta  = (s2[3] + s2[4]) - (s1[3] + s1[4])
     return if (totalDelta > 0) (totalDelta - idleDelta) * 100.0 / totalDelta else 0.0
 }
 
-// battery temp via sticky broadcast — no permissions needed, works on all stock devices
-// BatteryManager reports tenths of °C (e.g. 320 = 32.0°C); not cpu temp but tracks it under load
+// read battery temperature
 fun readBatteryTemp(context: Context): Double {
     val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
     val raw = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
     return if (raw > 0) raw / 10.0 else -1.0
 }
 
-// opens rear camera and starts a repeating capture session targeting 30 fps.
-// frames are sent to both the preview surface and the imagereader callback.
+// open camera and setup session
 @SuppressLint("MissingPermission")
 fun openCamera(
     context: Context,
@@ -1030,13 +978,13 @@ fun openCamera(
 ) {
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
-    // find the rear-facing camera id
+    // find rear camera id
     val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
         cameraManager.getCameraCharacteristics(id)
             .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
     } ?: run { Log.e(TAG, "no rear camera found"); return }
 
-    // prefer [30,30] fps range to lock frame rate; fall back to highest available
+    // pick best fps range
     val characteristics    = cameraManager.getCameraCharacteristics(cameraId)
     val availableFpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
     val targetFpsRange: Range<Int>? = availableFpsRanges?.firstOrNull { it.lower == 30 && it.upper == 30 }
@@ -1046,6 +994,7 @@ fun openCamera(
     surfaceTexture.setDefaultBufferSize(resW, resH)
     val previewSurface = Surface(surfaceTexture)
 
+    // open camera device
     cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
 
         override fun onOpened(camera: CameraDevice) {
@@ -1058,6 +1007,7 @@ fun openCamera(
             onCameraOpened(camera)
             val outputs = listOf(previewSurface, imageReader.surface)
 
+            // create capture session
             camera.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
 
                 override fun onConfigured(session: CameraCaptureSession) {

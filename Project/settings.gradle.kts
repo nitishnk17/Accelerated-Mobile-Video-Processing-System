@@ -1,3 +1,4 @@
+// setup project and repos
 pluginManagement {
     repositories {
         google {
@@ -19,5 +20,6 @@ dependencyResolutionManagement {
     }
 }
 
+// app name and folders
 rootProject.name = "CSProject"
 include(":app")

@@ -2,10 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- declares that this app requires camera to function; without this the app could be installed on camera-less devices -->
+    <!-- we need the camera to work -->
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
-    <!-- request the camera runtime permission -->
+    <!-- ask user for camera permission -->
     <uses-permission android:name="android.permission.CAMERA" />
 
     <application

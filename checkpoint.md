@@ -1,3 +1,4 @@
+[//]: # (this is the project roadmap and status)
 **Accelerated Mobile Video Processing System**
 Detailed Development Plan & Checklist
 Team: Salil Gujar (2025MCS2106) & Nitish Kumar (2025MCS2100)

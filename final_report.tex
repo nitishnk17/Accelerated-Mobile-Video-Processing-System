@@ -10,6 +10,7 @@
 \usepackage{enumitem}
 \usepackage{graphicx}
 \usepackage{xcolor}
+\usepackage{fancyhdr}
 
 \hypersetup{
     colorlinks=true,
@@ -18,24 +19,56 @@
     citecolor=black
 }
 
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{Indian Institute of Technology Delhi}}
+\fancyhead[R]{\small\textit{COP7001 -- Cornerstone Project}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0.4pt}
+
+\fancypagestyle{plain}{
+    \fancyhf{}
+    \fancyhead[L]{\small\textit{Indian Institute of Technology Delhi}}
+    \fancyhead[R]{\small\textit{COP7001 -- Cornerstone Project}}
+    \fancyfoot[C]{\thepage}
+    \renewcommand{\headrulewidth}{0.4pt}
+    \renewcommand{\footrulewidth}{0.4pt}
+}
+
 \setstretch{1.2}
 \setlist[itemize]{noitemsep, topsep=4pt}
 \setlist[enumerate]{noitemsep, topsep=4pt}
 \titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
 \titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
 
-\title{\textbf{Accelerated Mobile Video Processing System}\\[4pt]
-\large Real-Time Camera Pipeline Using CPU SIMD and Mobile GPU}
-
-\author{
-Nitish Kumar \and Salil Gujar
-}
-
-\date{\today}
-
 \begin{document}
 
-\maketitle
+\begin{titlepage}
+    \thispagestyle{empty}
+    \centering
+    \vspace*{1.5cm}
+
+    {\LARGE \textbf{Indian Institute of Technology Delhi}}\\[0.4em]
+    {\large Department of Computer Science and Engineering}\\[2.5cm]
+
+    {\huge \textbf{Accelerated Mobile Video Processing System}}\\[0.6em]
+    {\Large Real-Time Camera Pipeline Using CPU SIMD and Mobile GPU}\\[2.5cm]
+
+    {\large \textit{A report submitted for}}\\[0.4em]
+    {\large \textbf{Cornerstone Project (COP7001)}}\\[2cm]
+
+    \begin{tabular}{rl}
+        \textbf{Submitted by:} & Nitish Kumar \quad (2025MCS2100) \\[0.3em]
+                               & Salil Gujar \quad\, (2025MCS2106) \\[1.2em]
+        \textbf{Supervisor:}   & Prof.\ Kolin Paul \\[1.2em]
+        
+    \end{tabular}
+
+    \vfill
+
+    {\small Indian Institute of Technology Delhi, Hauz Khas, New Delhi -- 110016}
+\end{titlepage}
 
 \begin{abstract}
 In this project, we built a real-time Android application that captures live camera frames, processes them on the device, and displays the transformed output continuously on screen. The main goal of the work was not just to make a working camera app, but to study how mobile hardware acceleration can improve a continuous image-processing workload. We selected Sobel edge detection as the processing task because it is mathematically clear, works on every frame, depends on local pixel neighborhoods, and has a well-defined notion of correctness.
@@ -363,7 +396,7 @@ The GPU path was not just about shader speed. Transfer and synchronization overh
 
 \subsection{Challenge 4: Mode and Resolution Switching}
 
-Runtime switching exposed lifecycle issues that would not appear in a static pipeline. We had to fix stale resource reuse, synchronization races, and measurement contamination across different resolutions.
+Runtime switching exposed lifecycle issues that would not appear in a single-mode pipeline. We had to fix stale resource reuse, synchronization races, and measurement contamination across different resolutions.
 
 \subsection{Challenge 5: Measurement Quality}
 
@@ -405,20 +438,6 @@ From our current device screenshots and testing:
 
 These observations are important because they show that the assignment requirement of \textit{measurable improvement over baseline} is already satisfied by the implemented system.
 
-\section{Assignment-Oriented Evaluation}
-
-If we compare our current implementation directly against the assignment evaluation criteria, the match is as follows:
-
-\begin{itemize}
-\item \textbf{Functional correctness of output:} satisfied through baseline-referenced SIMD and GPU verification.
-\item \textbf{Achieved acceleration:} satisfied, because accelerated modes are clearly faster than baseline.
-\item \textbf{End-to-end latency and frame stability:} addressed through live E2E timing, FPS display, jitter monitoring, and switching fixes.
-\item \textbf{Quality of SIMD and GPU utilization:} visible through explicit activity indicators and actual runtime modes.
-\item \textbf{Clarity of dashboard:} improved by reducing debug clutter and keeping assignment-relevant information.
-\item \textbf{Overall system integration quality:} supported by live camera input, on-device processing, runtime switching, and stable output display.
-\end{itemize}
-
-In simple terms, the app now behaves like the kind of demonstrable system the assignment asks for.
 
 \section{What This Project Demonstrates}
 
@@ -432,6 +451,30 @@ Third, observability matters. Without the live dashboard, the project would be m
 
 Fourth, hybrid execution is not only a theoretical concept. With proper coordination, both CPU SIMD and GPU can contribute to the same frame-processing workload.
 
+\section{Contributions and AI Usage}
+
+\subsection{Team Contributions}
+
+The work was divided equally across all four development phases, with each team member taking ownership of specific stages within each phase.
+
+In Phase 1 (Camera Pipeline and Baseline System), Nitish Kumar set up the Android project and the NDK toolchain, integrated the Camera2 API for continuous frame capture on a background thread, and implemented the YUV-to-RGBA conversion in native C++. Salil Gujar wrote the scalar Sobel edge detection filter including border handling, configured the SurfaceView rendering path, and designed the initial live performance dashboard.
+
+In Phase 2 (SIMD Acceleration), Nitish developed the ARM NEON intrinsics warm-up experiment and wrote the NEON-vectorized Sobel filter that processes sixteen pixel positions at a time using 128-bit vector registers. Salil built the correctness verification framework that compares the SIMD output against the scalar baseline within a tight numerical tolerance, implemented the runtime mode-switching UI, and extended the dashboard with SIMD activity indicators and the speedup ratio display.
+
+In Phase 3 (GPU Acceleration and Hybrid Mode), Nitish set up the headless EGL compute context, wrote the OpenGL ES compute shader for GPU Sobel processing with texture-based input, and implemented the hybrid frame-split execution logic. Salil handled GPU correctness verification, performed sustained load and stress testing across all four mode transitions, and updated the dashboard with GPU and hybrid-specific indicators including the live split-ratio display.
+
+In Phase 4 (End-to-End Optimization and Finalization), Nitish carried out pipeline latency profiling using millisecond timestamps, drove memory and buffer optimization to eliminate garbage-collection pauses, and tuned the NEON filter loops for cache efficiency. Salil worked on GPU shader workgroup-size experimentation and the switch from SSBOs to texture-based access, implemented the dynamic hybrid split-ratio adjustment, and finalized the dashboard layout. The 30-minute final stability run and integration testing were a joint effort by both team members.
+
+\subsection{AI Usage}
+
+We used Large Language Models(Chatgpt, Gemini) as a support tool throughout this project, treating the AI as a collaborative assistant rather than a primary developer.
+
+We designed the core system architecture, the SIMD acceleration strategy, and the GPU integration approach ourselves. In particular, the idea to implement a hybrid execution mode by splitting the camera frame horizontally and routing each half concurrently to the CPU SIMD path and the GPU compute path was entirely our own concept. We also designed the adaptive balancing mechanism that dynamically adjusts the split ratio based on measured per-row throughput of each hardware resource so that both sides finish at roughly the same time. The AI did not suggest or contribute to this hybrid splitting strategy.
+
+For the NEON vectorization path, which we understood well due to our background in CPU-level optimization, the AI was used mainly for debugging, clarifying obscure compiler error messages, and performing static analysis to confirm that our logic was correct.
+
+For the GPU and hybrid modes, since we had less prior experience with the OpenGL ES compute API, the AI helped generate boilerplate code for EGL setup, shader compilation, and buffer management. We provided the high-level design and the hybrid strategy; the AI helped translate those ideas into working GLSL and C++ code. This allowed us to focus on system-level integration and adaptive balancing rather than low-level API mechanics that were new to us.
+
 \section{Conclusion}
 
 As a group of two students, we approached this project as a complete end-to-end mobile systems problem rather than a narrow optimization exercise. We began with a correct scalar baseline, then expanded the system step by step through SIMD acceleration, GPU acceleration, and finally hybrid execution. At each stage, we focused on correctness, runtime behavior, and live measurement.
@@ -439,9 +482,5 @@ As a group of two students, we approached this project as a complete end-to-end 
 The final result is a real-time Android application that captures camera frames, processes them continuously on the device, displays the transformed output live, and makes the use of mobile hardware acceleration visible through a dashboard. The system now supports multiple execution modes at runtime, reports meaningful performance information, and demonstrates how heterogeneous mobile resources can be used for a real-time workload.
 
 More than just building a faster Sobel filter, the project helped us understand how camera pipelines, native code, SIMD execution, GPU compute, synchronization, and measurement all interact in a real mobile system. The most important point is that our work now matches the assignment in practical terms: live camera input, accelerated frame processing, continuous on-screen display, four runtime modes, a visible dashboard, and clear improvement over baseline. That is the main value of the work we have done.
-
-\section*{Authors' Note}
-
-We have written this report in simple English on purpose. Since the project is a systems implementation project, we wanted the report to explain our thinking and our approach clearly rather than make it unnecessarily technical in language. The work itself is technical, but the explanation should still remain readable and human.
 
 \end{document}
