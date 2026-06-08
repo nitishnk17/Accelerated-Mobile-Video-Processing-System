@@ -1,6 +1,6 @@
 # Accelerate: Accelerated Mobile Video Processing System
 
-Hey there! We're **Salil Gujar** and **Nitish Kumar**, and this is our project for the Cornerstone course at IIT Delhi. We built **Accelerate**, an Android application designed to push the limits of mobile video processing by squeezing every bit of performance out of the CPU and GPU.
+We built **Accelerate**, an Android application designed to push the limits of mobile video processing by squeezing every bit of performance out of the CPU and GPU.
 
 ## What is this?
 
